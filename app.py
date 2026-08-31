@@ -21,6 +21,7 @@ See README.md for running it from your phone via GitHub Codespaces.
 
 import asyncio
 import base64
+import csv
 import json
 import os
 import struct
@@ -49,6 +50,9 @@ STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.5"))
 MAX_HOLD_SEC = int(os.environ.get("MAX_HOLD_SEC", "120"))
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "3"))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "25"))
+
+STATE_PATH = os.environ.get("STATE_PATH", "state.json")   # resume across restarts
+CSV_PATH = os.environ.get("CSV_PATH", "trades.csv")       # exportable trade log
 
 # ---------------------------------------------------------------------------
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -221,9 +225,10 @@ class Engine:
         self.positions[mint] = {
             "mint": mint, "curve": info["curve"], "tokens": tokens,
             "cost_eur": self.trade_eur, "entry_price": entry_price,
-            "entry_ts": time.monotonic(), "value_eur": self.trade_eur,
+            "entry_ts": time.time(), "value_eur": self.trade_eur,
             "pnl_pct": 0.0, "dev_buy_sol": info.get("dev_buy_sol"),
         }
+        self.save()
         await self.broadcast()
 
     async def simulate_sell(self, mint, reason):
@@ -237,16 +242,19 @@ class Engine:
         pnl = proceeds_eur - pos["cost_eur"]
         self.cash += proceeds_eur
         self.realized += pnl
-        self.closed.appendleft({
+        trade = {
             "mint": mint, "reason": reason, "pnl_eur": round(pnl, 3),
             "pnl_pct": round((proceeds_eur / pos["cost_eur"] - 1) * 100, 1),
-            "hold_sec": round(time.monotonic() - pos["entry_ts"]),
+            "hold_sec": round(time.time() - pos["entry_ts"]),
             "time": now_hms(),
-        })
+        }
+        self.closed.appendleft(trade)
+        self.csv_append(trade)
         del self.positions[mint]
         for l in self.launches:
             if l["mint"] == mint:
                 l["held"] = False
+        self.save()
         await self.broadcast()
 
     # ---- background loops ----
@@ -277,7 +285,7 @@ class Engine:
                 val = (sell_quote(c, pos["tokens"]) / LAMPORTS) * self.sol_eur
                 pos["value_eur"] = val
                 pos["pnl_pct"] = (val / pos["cost_eur"] - 1) * 100
-                held = time.monotonic() - pos["entry_ts"]
+                held = time.time() - pos["entry_ts"]
                 ratio = val / pos["cost_eur"]
                 reason = ("graduated" if c["complete"]
                           else "take_profit" if ratio >= TAKE_PROFIT_X
@@ -286,6 +294,7 @@ class Engine:
                 if reason:
                     await self.simulate_sell(mint, reason)
             self.pv.append({"t": int(time.time()), "v": round(self.portfolio(), 2)})
+            self.save()
             await self.broadcast()
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -305,8 +314,7 @@ class Engine:
             "positions": [{
                 "mint": p["mint"], "value": round(p["value_eur"], 2),
                 "pnl_pct": round(p["pnl_pct"], 1), "cost": p["cost_eur"],
-                "age": int(t - (time.time() - (time.monotonic() - p["entry_ts"]))),
-                "age_sec": int(time.monotonic() - p["entry_ts"]),
+                "age_sec": int(t - p["entry_ts"]),
                 "dev_buy": p["dev_buy_sol"],
             } for p in self.positions.values()],
             "launches": [{
@@ -330,6 +338,66 @@ class Engine:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
+
+    # ---- persistence ----
+    def save(self):
+        """Write resumable state to disk (atomic: temp file then rename)."""
+        data = {
+            "cash": self.cash, "realized": self.realized, "missed": self.missed,
+            "positions": self.positions, "closed": list(self.closed),
+        }
+        try:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATE_PATH)
+        except Exception as e:
+            print(f"[save] {e}", flush=True)
+
+    def load(self):
+        """Restore state from disk if present, so restarts don't reset to zero."""
+        if not os.path.exists(STATE_PATH):
+            return
+        try:
+            with open(STATE_PATH) as f:
+                data = json.load(f)
+            self.cash = data.get("cash", self.cash)
+            self.realized = data.get("realized", 0.0)
+            self.missed = data.get("missed", 0)
+            self.positions = data.get("positions", {})
+            self.closed = deque(data.get("closed", []), maxlen=60)
+            print(f"[load] resumed: €{self.cash:.2f} cash, "
+                  f"{len(self.positions)} open, {len(self.closed)} closed",
+                  flush=True)
+        except Exception as e:
+            print(f"[load] {e}", flush=True)
+
+    def csv_append(self, trade):
+        """Append one closed trade to an exportable CSV log."""
+        try:
+            new = not os.path.exists(CSV_PATH)
+            with open(CSV_PATH, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "mint", "reason", "pnl_eur",
+                                "pnl_pct", "hold_sec"])
+                w.writerow([trade["time"], trade["mint"], trade["reason"],
+                            trade["pnl_eur"], trade["pnl_pct"], trade["hold_sec"]])
+        except Exception as e:
+            print(f"[csv] {e}", flush=True)
+
+    async def reset(self):
+        """Wipe simulated state back to a fresh bankroll."""
+        self.cash = START_CASH_EUR
+        self.realized = 0.0
+        self.missed = 0
+        self.positions = {}
+        self.closed.clear()
+        self.pv.clear()
+        for l in self.launches:
+            l["held"] = False
+        self.save()
+        await self.broadcast()
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +470,11 @@ async def h_config(request):
     return web.json_response({"ok": True})
 
 
+async def h_reset(request):
+    await request.app["engine"].reset()
+    return web.json_response({"ok": True})
+
+
 async def h_ws(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -419,6 +492,7 @@ async def h_ws(request):
 async def on_startup(app):
     app["session"] = aiohttp.ClientSession()
     eng = Engine(app["session"])
+    eng.load()
     app["engine"] = eng
     app["tasks"] = [
         asyncio.create_task(solana_stream(eng)),
@@ -441,6 +515,7 @@ def make_app():
         web.post("/api/buy", h_buy),
         web.post("/api/sell", h_sell),
         web.post("/api/config", h_config),
+        web.post("/api/reset", h_reset),
         web.get("/ws", h_ws),
     ])
     app.on_startup.append(on_startup)
@@ -495,6 +570,8 @@ PAGE = r"""<!doctype html>
   .size{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--mut)}
   .size input{width:64px;background:var(--bg);border:1px solid var(--line);
     color:var(--ink);border-radius:9px;padding:6px 8px;font-family:"JetBrains Mono",monospace}
+  .reset{background:transparent;border:1px solid var(--line);color:var(--mut);
+    padding:7px 12px;border-radius:9px}
   /* cards */
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
     padding:12px 13px;margin-bottom:9px;display:flex;align-items:center;gap:11px}
@@ -533,6 +610,7 @@ PAGE = r"""<!doctype html>
       Auto-snipe every launch</div>
     <div class="size">€<input id="size" type="number" min="1" value="10"
       onchange="setSize(this.value)"> per trade</div>
+    <button class="reset" onclick="resetAll()">Reset</button>
   </div>
 </div>
 
@@ -634,6 +712,8 @@ async function toggleAuto(){await fetch("/api/config",{method:"POST",
   headers:{"content-type":"application/json"},body:JSON.stringify({auto:!S.auto})});}
 async function setSize(v){await fetch("/api/config",{method:"POST",
   headers:{"content-type":"application/json"},body:JSON.stringify({trade_eur:v})});}
+async function resetAll(){if(confirm("Reset everything back to €"+(S.start_cash||1000)+"? This clears all trades."))
+  await fetch("/api/reset",{method:"POST"});}
 
 function connect(){
   const proto=location.protocol==="https:"?"wss:":"ws:";
