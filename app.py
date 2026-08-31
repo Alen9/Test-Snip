@@ -43,6 +43,7 @@ from aiohttp import web
 RPC_HTTP = os.environ.get("RPC_HTTP", "https://mainnet.helius-rpc.com/?api-key=b842bf4c-c718-48ca-92d0-dbdc408e0b0c")
 RPC_WSS = os.environ.get("RPC_WSS", "wss://mainnet.helius-rpc.com/?api-key=b842bf4c-c718-48ca-92d0-dbdc408e0b0c")
 PORT = int(os.environ.get("PORT", "8080"))
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")  # set on Railway to lock the dashboard
 
 START_CASH_EUR = float(os.environ.get("START_CASH_EUR", "1000"))
 TRADE_EUR = float(os.environ.get("TRADE_EUR", "10"))
@@ -54,8 +55,22 @@ EVOLVE_INTERVAL_SEC = int(os.environ.get("EVOLVE_INTERVAL_SEC", "3600"))  # 1h; 
 MAX_POS_PER_STRAT = int(os.environ.get("MAX_POS_PER_STRAT", "15"))
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "3"))  # raise to 6-8 on free RPC
 
-STATE_PATH = os.environ.get("STATE_PATH", "state.json")
-CSV_PATH = os.environ.get("CSV_PATH", "trades.csv")
+# Where to save. On Railway, a mounted volume auto-sets RAILWAY_VOLUME_MOUNT_PATH,
+# so we use that directly — no hand-typed path to get mangled by phone autocorrect.
+_VOL = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+if _VOL:
+    STATE_PATH = os.path.join(_VOL, "state.json")
+    CSV_PATH = os.path.join(_VOL, "trades.csv")
+else:
+    STATE_PATH = os.environ.get("STATE_PATH", "state.json").strip()
+    CSV_PATH = os.environ.get("CSV_PATH", "trades.csv").strip()
+try:
+    for _p in (STATE_PATH, CSV_PATH):
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+except Exception as _e:
+    print(f"[init] could not create save dir: {_e}", flush=True)
 
 # ---------------------------------------------------------------------------
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -461,6 +476,9 @@ class Pool:
                      "window_start_equity": st.window_start_equity}
                     for st in self.strategies]}
         try:
+            d = os.path.dirname(STATE_PATH)
+            if d:
+                os.makedirs(d, exist_ok=True)
             tmp = STATE_PATH + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f)
@@ -548,20 +566,38 @@ async def solana_stream(pool):
 # ---------------------------------------------------------------------------
 # Web
 # ---------------------------------------------------------------------------
+def authed(request):
+    if not ACCESS_TOKEN:
+        return True
+    return (request.query.get("k") == ACCESS_TOKEN
+            or request.headers.get("X-Access-Token") == ACCESS_TOKEN)
+
+
+_DENY = "Unauthorized — add ?k=YOUR_TOKEN to the URL"
+
+
 async def h_index(request):
+    if not authed(request):
+        return web.Response(status=401, text=_DENY)
     return web.Response(text=PAGE, content_type="text/html")
 
 
 async def h_state(request):
+    if not authed(request):
+        return web.Response(status=401, text=_DENY)
     return web.json_response(request.app["pool"].snapshot())
 
 
 async def h_reset(request):
+    if not authed(request):
+        return web.Response(status=401, text=_DENY)
     await request.app["pool"].reset()
     return web.json_response({"ok": True})
 
 
 async def h_ws(request):
+    if not authed(request):
+        return web.Response(status=401, text=_DENY)
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     pool = request.app["pool"]
@@ -689,6 +725,8 @@ PAGE = r"""<!doctype html>
 <div class="foot" id="foot"></div>
 
 <script>
+const K=new URLSearchParams(location.search).get('k')||'';
+const Q=K?('?k='+encodeURIComponent(K)):'';
 let chart;
 function eur(n){return "€"+n.toFixed(2)}
 function sgn(n){return (n>=0?"+":"")+n.toFixed(2)}
@@ -750,11 +788,11 @@ function drawChart(pv){
 }
 
 async function resetAll(){if(confirm("Throw away the whole pool and start from random settings?"))
-  await fetch("/api/reset",{method:"POST"});}
+  await fetch("/api/reset"+Q,{method:"POST"});}
 
 function connect(){
   const proto=location.protocol==="https:"?"wss:":"ws:";
-  const ws=new WebSocket(proto+"//"+location.host+"/ws");
+  const ws=new WebSocket(proto+"//"+location.host+"/ws"+Q);
   ws.onmessage=e=>render(JSON.parse(e.data));
   ws.onclose=()=>setTimeout(connect,1500);
 }
@@ -767,5 +805,6 @@ if __name__ == "__main__":
     print(f"HTTP {RPC_HTTP}\nWSS  {RPC_WSS}")
     print(f"pool={POOL_SIZE}  evolve every {EVOLVE_INTERVAL_SEC}s  "
           f"trade=€{TRADE_EUR}  dashboard -> http://localhost:{PORT}")
+    print(f"state file: {STATE_PATH!r}   trades: {CSV_PATH!r}")
     print("SIMULATED CASH ONLY — no wallet, no real trades\n")
-    web.run_app(make_app(), port=PORT)
+    web.run_app(make_app(), host="0.0.0.0", port=PORT)
