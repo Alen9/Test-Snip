@@ -34,8 +34,8 @@ from aiohttp import web
 # ---------------------------------------------------------------------------
 # Config (env-overridable)
 # ---------------------------------------------------------------------------
-RPC_HTTP = os.environ.get("RPC_HTTP", "https://api.mainnet-beta.solana.com")
-RPC_WSS = os.environ.get("RPC_WSS", "wss://api.mainnet-beta.solana.com")
+RPC_HTTP = os.environ.get("RPC_HTTP", "https://mainnet.helius-rpc.com/?api-key=b842bf4c-c718-48ca-92d0-dbdc408e0b0c")
+RPC_WSS = os.environ.get("RPC_WSS", "wss://mainnet.helius-rpc.com/?api-key=b842bf4c-c718-48ca-92d0-dbdc408e0b0c")
 PORT = int(os.environ.get("PORT", "8080"))
 
 START_CASH_EUR = float(os.environ.get("START_CASH_EUR", "1000"))
