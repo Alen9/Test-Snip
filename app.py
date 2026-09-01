@@ -118,6 +118,10 @@ def now_hms():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
+def now_date():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 # ---------------------------------------------------------------------------
 # Curve math
 # ---------------------------------------------------------------------------
@@ -184,6 +188,12 @@ class Strategy:
     trades: int = 0
     wins: int = 0
     window_start_equity: float = 0.0
+    combo_id: int = 0                       # stable identity of this combination
+    born_day: int = 0                       # day index it was created
+    days_alive: int = 0                     # daily evolutions survived
+    days_won: int = 0                       # days it was the #1 performer
+    cum_pnl: float = 0.0                    # total P&L over its whole life
+    day_pnls: list = field(default_factory=list)  # per-day scores
 
 
 # ---------------------------------------------------------------------------
@@ -199,14 +209,21 @@ class Pool:
         self.last_evolve = time.time()
         self.launches = deque(maxlen=40)
         self.pv = deque(maxlen=360)
+        self.recent = deque(maxlen=30)      # global feed of recent closes (coin + result)
+        self.day_index = 0                  # counts daily evolutions
+        self.next_combo_id = 1
+        self.ledger = deque(maxlen=90)       # one record per day: that day's winner
+        self.best_ever = None                # all-time best combination by cumulative P&L
         self.clients = set()
         for _ in range(POOL_SIZE):
             self._new_strategy(rand_genome())
 
-    def _new_strategy(self, genome):
+    def _new_strategy(self, genome, born_day=0):
         st = Strategy(id=self.next_id, genome=genome, cash=START_CASH_EUR,
-                      window_start_equity=START_CASH_EUR)
+                      window_start_equity=START_CASH_EUR,
+                      combo_id=self.next_combo_id, born_day=born_day)
         self.next_id += 1
+        self.next_combo_id += 1
         self.strategies.append(st)
         return st
 
@@ -354,6 +371,8 @@ class Pool:
         st.trades += 1
         if pnl > 0:
             st.wins += 1
+        self.recent.appendleft({"mint": mint, "id": st.id, "reason": reason,
+                                "pnl": round(pnl, 2), "time": now_hms()})
         self.csv_append(st, pos, pnl, reason)
 
     # ---- loops ----
@@ -409,51 +428,100 @@ class Pool:
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
     def evolve(self):
-        ranked = sorted(self.strategies,
-                        key=lambda st: self.equity(st) - st.window_start_equity,
-                        reverse=True)
-        keep = ranked[:max(1, len(ranked) // 2)]         # elites survive
-        drop = ranked[len(keep):]
+        self.day_index += 1
+        # 1. score the day for every strategy and fold into its lifetime record
+        for st in self.strategies:
+            day_score = self.equity(st) - st.window_start_equity
+            st.day_pnls.append(round(day_score, 2))
+            st.day_pnls = st.day_pnls[-60:]
+            st.cum_pnl += day_score
+
+        ranked = sorted(self.strategies, key=lambda st: st.day_pnls[-1], reverse=True)
+        winner = ranked[0]
+        winner.days_won += 1
+
+        # 2. record this day's champion in the permanent ledger
+        self.ledger.appendleft({
+            "day": self.day_index, "date": now_date(),
+            "combo_id": winner.combo_id, "genome": dict(winner.genome),
+            "day_pnl": winner.day_pnls[-1], "cum_pnl": round(winner.cum_pnl, 2),
+            "days_alive": winner.days_alive + 1, "days_won": winner.days_won,
+        })
+
+        # 3. survivors = top half of the day, PLUS a rescue for the all-time best
+        #    cumulative combo so a proven long-run winner never dies on one bad day
+        keep = ranked[:max(1, len(ranked) // 2)]
+        best_cum = max(self.strategies, key=lambda st: st.cum_pnl)
+        if best_cum not in keep:
+            keep.append(best_cum)
+        keep_ids = {id(s) for s in keep}
         parents = [st.genome for st in keep]
-        for st in drop:                                   # rebirth losers from winners
-            st.genome = mutate(random.choice(parents))
-            st.cash = START_CASH_EUR
-            st.positions = {}
-            st.realized = 0.0
-            st.trades = 0
-            st.wins = 0
-            st.id = self.next_id
-            self.next_id += 1
+
+        for st in self.strategies:
+            if id(st) in keep_ids:
+                st.days_alive += 1                       # survived another day
+            else:                                        # rebreed from a winner = new combo
+                st.genome = mutate(random.choice(parents))
+                st.cash = START_CASH_EUR
+                st.positions = {}
+                st.realized = st.trades = st.wins = 0
+                st.combo_id = self.next_combo_id
+                self.next_combo_id += 1
+                st.born_day = self.day_index
+                st.days_alive = st.days_won = 0
+                st.cum_pnl = 0.0
+                st.day_pnls = []
+                st.id = self.next_id
+                self.next_id += 1
+
         for st in self.strategies:
             st.window_start_equity = self.equity(st)
+
+        # 4. update all-time hall-of-fame record
+        champ = max(self.strategies, key=lambda st: st.cum_pnl)
+        if not self.best_ever or champ.cum_pnl > self.best_ever["cum_pnl"]:
+            self.best_ever = {"combo_id": champ.combo_id, "genome": dict(champ.genome),
+                              "cum_pnl": round(champ.cum_pnl, 2),
+                              "days_alive": champ.days_alive, "days_won": champ.days_won}
+
         self.generation += 1
         self.last_evolve = time.time()
-        print(f"[evolve] gen {self.generation}: kept {len(keep)}, rebred {len(drop)}",
-              flush=True)
+        print(f"[evolve] day {self.day_index}: winner combo #{winner.combo_id} "
+              f"(day {winner.day_pnls[-1]:+.2f}€, cum {winner.cum_pnl:+.2f}€)", flush=True)
 
     # ---- state / io ----
     def snapshot(self):
         board = []
         for st in self.strategies:
             eq = self.equity(st)
+            last_day = st.day_pnls[-1] if st.day_pnls else 0
             board.append({
-                "id": st.id, "genome": st.genome, "equity": round(eq, 2),
+                "id": st.id, "combo": st.combo_id, "genome": st.genome,
+                "equity": round(eq, 2),
                 "score": round(eq - st.window_start_equity, 2),
                 "realized": round(st.realized, 2), "trades": st.trades,
                 "winrate": round(st.wins / st.trades * 100) if st.trades else 0,
                 "open": len(st.positions),
+                "days": st.days_alive, "won": st.days_won,
+                "cum": round(st.cum_pnl, 2),
+                "rising": st.days_alive <= 6 and st.cum_pnl > 0 and last_day > 0,
+                "holds": [{"mint": p["mint"],
+                           "pnl": round((p["value_eur"] / p["cost_eur"] - 1) * 100)}
+                          for p in st.positions.values()],
             })
         board.sort(key=lambda x: x["equity"], reverse=True)
         t = time.time()
         return {
             "generation": self.generation, "pool": len(self.strategies),
             "sol_eur": round(self.sol_eur, 2), "trade_eur": TRADE_EUR,
-            "start_cash": START_CASH_EUR,
+            "start_cash": START_CASH_EUR, "day_index": self.day_index,
             "evolve_in": max(0, int(EVOLVE_INTERVAL_SEC - (t - self.last_evolve))),
             "champion": board[0] if board else None, "board": board,
+            "best_ever": self.best_ever, "ledger": list(self.ledger)[:30],
             "total_realized": round(sum(st.realized for st in self.strategies), 2),
             "launches": [{"mint": l["mint"], "dev_buy": l["dev_buy_sol"],
                           "age_sec": int(t - l["age"])} for l in self.launches],
+            "recent": list(self.recent),
             "pv": list(self.pv),
         }
 
@@ -469,11 +537,16 @@ class Pool:
 
     def save(self):
         data = {"generation": self.generation, "last_evolve": self.last_evolve,
-                "next_id": self.next_id, "strategies": [
+                "next_id": self.next_id, "day_index": self.day_index,
+                "next_combo_id": self.next_combo_id, "ledger": list(self.ledger),
+                "best_ever": self.best_ever, "strategies": [
                     {"id": st.id, "genome": st.genome, "cash": st.cash,
                      "positions": st.positions, "realized": st.realized,
                      "trades": st.trades, "wins": st.wins,
-                     "window_start_equity": st.window_start_equity}
+                     "window_start_equity": st.window_start_equity,
+                     "combo_id": st.combo_id, "born_day": st.born_day,
+                     "days_alive": st.days_alive, "days_won": st.days_won,
+                     "cum_pnl": st.cum_pnl, "day_pnls": st.day_pnls}
                     for st in self.strategies]}
         try:
             d = os.path.dirname(STATE_PATH)
@@ -495,13 +568,21 @@ class Pool:
             self.generation = data.get("generation", 1)
             self.last_evolve = data.get("last_evolve", time.time())
             self.next_id = data.get("next_id", 1)
+            self.day_index = data.get("day_index", 0)
+            self.next_combo_id = data.get("next_combo_id", 1)
+            self.ledger = deque(data.get("ledger", []), maxlen=90)
+            self.best_ever = data.get("best_ever")
             self.strategies = [
                 Strategy(id=d["id"], genome=d["genome"], cash=d["cash"],
                          positions=d.get("positions", {}), realized=d.get("realized", 0.0),
                          trades=d.get("trades", 0), wins=d.get("wins", 0),
-                         window_start_equity=d.get("window_start_equity", START_CASH_EUR))
+                         window_start_equity=d.get("window_start_equity", START_CASH_EUR),
+                         combo_id=d.get("combo_id", 0), born_day=d.get("born_day", 0),
+                         days_alive=d.get("days_alive", 0), days_won=d.get("days_won", 0),
+                         cum_pnl=d.get("cum_pnl", 0.0), day_pnls=d.get("day_pnls", []))
                 for d in data.get("strategies", [])]
-            print(f"[load] resumed gen {self.generation}, {len(self.strategies)} strategies",
+            print(f"[load] resumed day {self.day_index}, gen {self.generation}, "
+                  f"{len(self.strategies)} strategies, {len(self.ledger)} ledger days",
                   flush=True)
         except Exception as e:
             print(f"[load] {e}", flush=True)
@@ -523,9 +604,14 @@ class Pool:
     async def reset(self):
         self.strategies = []
         self.next_id = 1
+        self.next_combo_id = 1
         self.generation = 1
+        self.day_index = 0
         self.last_evolve = time.time()
         self.pv.clear()
+        self.recent.clear()
+        self.ledger.clear()
+        self.best_ever = None
         for _ in range(POOL_SIZE):
             self._new_strategy(rand_genome())
         self.save()
@@ -671,9 +757,14 @@ PAGE = r"""<!doctype html>
   .crown{color:var(--gold)}
   .big{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:38px;
     line-height:1.05;margin:3px 0 8px;letter-spacing:-.02em}
-  .genes{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-  .gene{font-family:"JetBrains Mono",monospace;font-size:12px;background:var(--bg);
-    border:1px solid var(--line);border-radius:8px;padding:4px 8px;color:var(--accent2)}
+  .genes{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 2px}
+  .gene{display:flex;flex-direction:column;gap:2px;background:var(--bg);
+    border:1px solid var(--line);border-radius:10px;padding:7px 11px;min-width:66px}
+  .gl{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+  .gv{font-family:"JetBrains Mono",monospace;font-size:14px;font-weight:600;color:var(--ink)}
+  .coin{font-family:"JetBrains Mono",monospace;font-size:12.5px;color:var(--accent2);
+    text-decoration:none;white-space:nowrap}
+  .coin:active{opacity:.55}
   .subrow{display:flex;gap:16px;margin-top:12px;font-size:13px;flex-wrap:wrap}
   .subrow b{font-weight:600}
   .status{display:flex;gap:14px;font-size:12px;color:var(--mut);margin-top:14px;
@@ -681,17 +772,36 @@ PAGE = r"""<!doctype html>
   .reset{background:transparent;border:1px solid var(--line);color:var(--mut);
     padding:6px 11px;border-radius:9px;font-family:Archivo;font-weight:600;font-size:12px;cursor:pointer}
   canvas{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px;margin-top:6px}
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{text-align:left;color:var(--mut);font-weight:600;padding:6px 4px;font-size:11px}
-  td{padding:9px 4px;border-top:1px solid var(--line)}
-  td.mono,th.r{text-align:right}
-  td.mono{font-family:"JetBrains Mono",monospace}
-  tr.top td{background:rgba(124,108,255,.08)}
-  .rank{color:var(--mut);width:20px}
+  .scard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:14px;margin-bottom:11px}
+  .scard.lead{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .shead{display:flex;align-items:baseline;gap:10px}
+  .rank{color:var(--mut);font-family:"JetBrains Mono",monospace;font-size:13px}
+  .eq{font-size:16px;font-weight:700}
+  .pl{margin-left:auto;font-size:14px;font-weight:600}
+  .smeta{font-size:12px;color:var(--mut);margin-top:6px}
+  .holds{margin-top:10px;font-size:12.5px;line-height:1.95;color:var(--mut)}
+  .rrow{display:flex;align-items:center;gap:10px;padding:9px 2px;
+    border-top:1px solid var(--line);font-size:13px}
+  .rrow:first-child{border-top:none}
+  .tag{font-size:11px;color:var(--mut);background:var(--bg);border:1px solid var(--line);
+    border-radius:7px;padding:2px 7px}
+  .rt{margin-left:auto;color:var(--mut);font-size:11px}
+  .launches{line-height:2.2}
+  .hof{background:linear-gradient(160deg,#1c1733,#241b3f);border:1px solid var(--gold);
+    border-radius:14px;padding:14px}
+  .hoflab{font-size:12px;color:var(--gold)}
+  .hofbig{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:26px;margin:4px 0}
+  .lrow{display:flex;align-items:center;gap:9px;padding:9px 2px;
+    border-top:1px solid var(--line);font-size:12.5px;flex-wrap:wrap}
+  .lrow:first-child{border-top:none}
+  .lday{font-family:"JetBrains Mono",monospace;color:var(--mut);min-width:52px}
+  .badge{font-size:10px;font-weight:700;color:#0d0f1a;background:var(--gold);
+    border-radius:6px;padding:1px 6px;margin-left:6px}
+  .rise{font-size:10px;font-weight:700;color:var(--gain);border:1px solid var(--gain);
+    border-radius:6px;padding:1px 6px;margin-left:6px}
   .empty{color:var(--mut);font-size:13px;padding:12px 2px}
   .foot{color:var(--mut);font-size:11px;margin-top:22px;line-height:1.5}
-  .launch{display:inline-block;font-family:"JetBrains Mono",monospace;font-size:11px;
-    color:var(--mut);margin:2px 8px 2px 0}
 </style></head>
 <body>
 <div class="sim">simulated cash · evolving strategy pool · no real money</div>
@@ -699,7 +809,7 @@ PAGE = r"""<!doctype html>
 <div class="hero">
   <div class="hlabel"><span class="crown">♛</span> Best strategy right now</div>
   <div class="big" id="champEq">€—</div>
-  <div class="genes" id="champGenes"></div>
+  <div id="champGenes"></div>
   <div class="subrow">
     <span>All-time P&amp;L <b class="mono" id="champPnl">—</b></span>
     <span>Trades <b class="mono" id="champTrades">—</b></span>
@@ -716,11 +826,20 @@ PAGE = r"""<!doctype html>
 <h2>Best strategy equity over time</h2>
 <canvas id="chart" height="150"></canvas>
 
-<h2>Leaderboard — every strategy, best first</h2>
+<h2>🏆 Hall of fame — best combination ever</h2>
+<div id="hof"><div class="empty">Fills in after the first daily evolve…</div></div>
+
+<h2>Daily champions — winner of each day</h2>
+<div id="ledger"><div class="empty">No days completed yet…</div></div>
+
+<h2>Recent snipes — what got bought &amp; how it ended</h2>
+<div id="recent"><div class="empty">No closed trades yet…</div></div>
+
+<h2>Leaderboard — living strategies, best first</h2>
 <div id="board"><div class="empty">Warming up…</div></div>
 
-<h2>Live launches</h2>
-<div id="launches"><div class="empty">Waiting for the next mint…</div></div>
+<h2>Live launches (tap to open on pump.fun)</h2>
+<div id="launches" class="launches"><div class="empty">Waiting for the next mint…</div></div>
 
 <div class="foot" id="foot"></div>
 
@@ -730,11 +849,13 @@ const Q=K?('?k='+encodeURIComponent(K)):'';
 let chart;
 function eur(n){return "€"+n.toFixed(2)}
 function sgn(n){return (n>=0?"+":"")+n.toFixed(2)}
-function genes(g){return `<span class="gene">TP ${g.tp}×</span>
-  <span class="gene">SL ${Math.round(g.sl*100)}%</span>
-  <span class="gene">≤${g.hold}s</span>
-  <span class="gene">dev≤${g.dev_max}◎</span>
-  <span class="gene">slip ${g.slip}%</span>`}
+function pct(n){return (n>=0?"+":"")+Math.round(n)+"%"}
+function short(a){return a.slice(0,4)+"…"+a.slice(-4)}
+function coin(m,label){return `<a class="coin" target="_blank" rel="noopener" href="https://pump.fun/coin/${m}">${label||short(m)}</a>`}
+const REASON={tp:"2× hit",sl:"stopped out",timeout:"timed out",rug:"rugged",
+  dead:"went dead",graduated:"graduated",manual:"sold"};
+function chip(l,v){return `<div class="gene"><span class="gl">${l}</span><span class="gv">${v}</span></div>`}
+function genes(g){return `<div class="genes">${chip("take",g.tp+"×")}${chip("stop",Math.round(g.sl*100)+"%")}${chip("hold",g.hold+"s")}${chip("dev ≤",g.dev_max+"◎")}${chip("slip",g.slip+"%")}</div>`}
 
 function render(s){
   const c=s.champion;
@@ -751,23 +872,48 @@ function render(s){
   const m=Math.floor(s.evolve_in/60), sec=s.evolve_in%60;
   document.getElementById("evolve").textContent=m+"m "+sec+"s";
 
-  let rows=s.board.map((b,i)=>{
+  const hof=s.best_ever;
+  document.getElementById("hof").innerHTML = hof?
+    `<div class="hof"><div class="hoflab">combo #${hof.combo_id} · best cumulative P&L ever</div>
+     <div class="hofbig ${hof.cum_pnl>=0?'up':'down'}">${sgn(hof.cum_pnl)}€</div>
+     ${genes(hof.genome)}
+     <div class="smeta">survived ${hof.days_alive} days · won ${hof.days_won} days</div></div>`
+    : '<div class="empty">Fills in after the first daily evolve…</div>';
+
+  document.getElementById("ledger").innerHTML = (s.ledger&&s.ledger.length)?
+    s.ledger.map(d=>{const g=d.genome;
+      return `<div class="lrow"><span class="lday">Day ${d.day}</span>
+        <span class="gene" style="flex-direction:row;gap:6px;padding:4px 8px">
+          <span class="gv">${g.tp}× · ${Math.round(g.sl*100)}% · ${g.hold}s · dev${g.dev_max} · slip${g.slip}</span></span>
+        <span class="mono ${d.day_pnl>=0?'up':'down'}">${sgn(d.day_pnl)}€</span>
+        <span class="rt">#${d.combo_id}${d.days_alive>1?' · '+d.days_alive+'d streak':''}</span></div>`}).join("")
+    : '<div class="empty">No days completed yet…</div>';
+
+  document.getElementById("board").innerHTML=s.board.map((b,i)=>{
     const cl=b.realized>=0?"up":"down";
-    return `<tr class="${i===0?'top':''}">
-      <td class="rank">${i+1}</td>
-      <td>${genes(b.genome)}</td>
-      <td class="mono">${eur(b.equity)}</td>
-      <td class="mono ${cl}">${sgn(b.realized)}</td>
-      <td class="mono">${b.trades}</td>
-      <td class="mono">${b.winrate}%</td></tr>`}).join("");
-  document.getElementById("board").innerHTML=
-    `<table><tr><th class="rank"></th><th>strategy (its settings)</th>
-     <th class="r">equity</th><th class="r">P&amp;L</th><th class="r">trades</th>
-     <th class="r">win</th></tr>${rows}</table>`;
+    const holds=(b.holds&&b.holds.length)?
+      `<div class="holds">holding: `+b.holds.map(h=>
+        coin(h.mint)+` <span class="${h.pnl>=0?'up':'down'}">${pct(h.pnl)}</span>`).join(" · ")+`</div>`:"";
+    const tags=(i===0?'<span class="badge">LEADER</span>':'')+(b.rising?'<span class="rise">🔥 RISING</span>':'');
+    return `<div class="scard ${i===0?'lead':''}">
+      <div class="shead"><span class="rank">#${i+1}</span>
+        <span class="eq mono">${eur(b.equity)}</span>
+        <span class="pl mono ${cl}">${sgn(b.realized)}€</span></div>
+      ${genes(b.genome)}
+      <div class="smeta">combo #${b.combo}${tags} · alive ${b.days}d · won ${b.won}d · cum <span class="${b.cum>=0?'up':'down'}">${sgn(b.cum)}€</span></div>
+      <div class="smeta">${b.trades} trades · ${b.winrate}% win · holding ${b.open}</div>
+      ${holds}</div>`}).join("");
+
+  document.getElementById("recent").innerHTML = (s.recent&&s.recent.length)?
+    s.recent.map(r=>`<div class="rrow">${coin(r.mint)}
+      <span class="tag">${REASON[r.reason]||r.reason}</span>
+      <span class="mono ${r.pnl>=0?'up':'down'}">${sgn(r.pnl)}€</span>
+      <span class="rt">#${r.id} · ${r.time}</span></div>`).join("")
+    : '<div class="empty">No closed trades yet…</div>';
 
   document.getElementById("launches").innerHTML = s.launches.length?
-    s.launches.map(l=>`<span class="launch">${l.mint.slice(0,4)}…${l.mint.slice(-4)}
-      ${l.dev_buy!=null?"("+l.dev_buy.toFixed(2)+"◎)":""} ${l.age_sec}s</span>`).join("")
+    s.launches.map(l=>coin(l.mint, short(l.mint)
+      +(l.dev_buy!=null?" ("+l.dev_buy.toFixed(2)+"◎)":"")+" · "+l.age_sec+"s")).join("<br>")
     : '<div class="empty">Waiting for the next mint…</div>';
 
   document.getElementById("foot").textContent=
