@@ -55,6 +55,26 @@ EVOLVE_INTERVAL_SEC = int(os.environ.get("EVOLVE_INTERVAL_SEC", "3600"))  # 1h; 
 MAX_POS_PER_STRAT = int(os.environ.get("MAX_POS_PER_STRAT", "15"))
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "3"))  # raise to 6-8 on free RPC
 
+# Which brain this instance runs: "snipe" (basic), "smart" (anti-rug filters),
+# or "hunt" (momentum on tokens that already have some life). Deploy the same
+# repo three times with a different BOT_MODE each.
+BOT_MODE = os.environ.get("BOT_MODE", "snipe").strip().lower()
+if BOT_MODE not in ("snipe", "smart", "hunt", "league"):
+    BOT_MODE = "snipe"
+
+# league mode: comma-separated "label|https://bot-url" entries to aggregate.
+PEERS = []
+for _part in os.environ.get("PEERS", "").split(","):
+    _part = _part.strip()
+    if "|" in _part:
+        _lbl, _url = _part.split("|", 1)
+        PEERS.append((_lbl.strip(), _url.strip().rstrip("/")))
+
+# hunt-only knobs
+HUNT_WATCH_MAX = int(os.environ.get("HUNT_WATCH_MAX", "30"))    # tokens tracked at once
+HUNT_MAX_AGE = int(os.environ.get("HUNT_MAX_AGE", "1800"))      # drop a token after this many s
+HUNT_SCAN_SEC = float(os.environ.get("HUNT_SCAN_SEC", "12"))    # how often to re-price the watchlist
+
 # Where to save. On Railway, a mounted volume auto-sets RAILWAY_VOLUME_MOUNT_PATH,
 # so we use that directly — no hand-typed path to get mangled by phone autocorrect.
 _VOL = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -79,14 +99,28 @@ LAMPORTS = 1_000_000_000
 TOKEN_UNITS = 1_000_000
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# Strategy "genes" and their allowed ranges.
-GENE_BOUNDS = {
-    "tp":      (1.2, 5.0),    # take profit multiple (x cost)
-    "sl":      (0.20, 0.80),  # stop loss (fraction of cost lost)
-    "hold":    (30, 300),     # max hold seconds
-    "slip":    (8.0, 50.0),   # skip launch if it ran up more than this % while landing
-    "dev_max": (0.3, 25.0),   # skip launch if dev bought more than this many SOL
+# Strategy "genes" and their allowed ranges, chosen per bot mode.
+_EXIT_GENES = {
+    "tp":   (1.2, 5.0),     # take profit multiple (x cost)
+    "sl":   (0.20, 0.80),   # stop loss (fraction of cost lost)
+    "hold": (30, 300),      # max hold seconds
 }
+_MODE_GENES = {
+    "snipe": {**_EXIT_GENES,
+              "slip": (8.0, 50.0),      # skip if it ran up more than this % while landing
+              "dev_max": (0.3, 25.0)},  # skip if dev bought more than this many SOL
+    "smart": {**_EXIT_GENES,
+              "slip": (8.0, 50.0),
+              "dev_max": (0.3, 25.0),   # dev bought too much = dump risk
+              "dev_min": (0.0, 3.0),    # dev bought too little = no skin in game
+              "top_hold_max": (20.0, 95.0)},  # skip if biggest holder owns > this % of float
+    "hunt":  {**_EXIT_GENES,
+              "dev_max": (0.3, 25.0),
+              "mom_pct": (5.0, 80.0),   # only buy if price pumped at least this % ...
+              "mom_window": (10, 120)}, # ... within this many seconds
+}
+GENE_BOUNDS = _MODE_GENES[BOT_MODE]
+_INT_GENES = ("hold", "mom_window")
 
 
 def b58decode(s):
@@ -159,22 +193,24 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _round_gene(k, v):
+    if k in _INT_GENES:
+        return int(round(v))
+    if k in ("tp", "sl"):
+        return round(v, 2)
+    return round(v, 1)
+
+
 def rand_genome():
-    return {
-        "tp": round(random.uniform(*GENE_BOUNDS["tp"]), 2),
-        "sl": round(random.uniform(*GENE_BOUNDS["sl"]), 2),
-        "hold": random.randint(*GENE_BOUNDS["hold"]),
-        "slip": round(random.uniform(*GENE_BOUNDS["slip"]), 1),
-        "dev_max": round(random.uniform(*GENE_BOUNDS["dev_max"]), 1),
-    }
+    return {k: _round_gene(k, random.uniform(lo, hi))
+            for k, (lo, hi) in GENE_BOUNDS.items()}
 
 
 def mutate(g):
     ng = dict(g)
     for k, (lo, hi) in GENE_BOUNDS.items():
-        if random.random() < 0.5:                 # mutate ~half the genes
-            v = clamp(ng[k] * random.uniform(0.7, 1.3), lo, hi)
-            ng[k] = int(round(v)) if k == "hold" else round(v, 1 if k == "slip" else 2)
+        if k in ng and random.random() < 0.5:          # mutate ~half the genes
+            ng[k] = _round_gene(k, clamp(ng[k] * random.uniform(0.7, 1.3), lo, hi))
     return ng
 
 
@@ -214,6 +250,7 @@ class Pool:
         self.next_combo_id = 1
         self.ledger = deque(maxlen=90)       # one record per day: that day's winner
         self.best_ever = None                # all-time best combination by cumulative P&L
+        self.watch = {}                      # hunt mode: tokens being tracked for momentum
         self.clients = set()
         for _ in range(POOL_SIZE):
             self._new_strategy(rand_genome())
@@ -295,6 +332,15 @@ class Pool:
         self.launches.appendleft(info)
         await self.broadcast()
 
+        if BOT_MODE == "hunt":                  # don't snipe — add to the watchlist
+            self.watch[info["mint"]] = {"curve": info["curve"],
+                                        "first_seen": time.time(), "prices": [],
+                                        "dev_buy": info["dev_buy_sol"]}
+            while len(self.watch) > HUNT_WATCH_MAX:
+                oldest = min(self.watch, key=lambda m: self.watch[m]["first_seen"])
+                self.watch.pop(oldest, None)
+            return
+
         c0 = await self.get_curve(info["curve"])
         p0 = spot_price(c0)
         elapsed = time.monotonic() - detected_at
@@ -303,9 +349,33 @@ class Pool:
         if not isinstance(c1, dict) or c1["complete"]:
             return
         p1 = spot_price(c1)
+        if BOT_MODE == "smart":                 # anti-rug: read holder concentration
+            info["top_hold"] = await self.get_top_holder_pct(info["mint"])
         for st in self.strategies:
             self.try_enter(st, info, p0, p1, c1)
         await self.broadcast()
+
+    async def hunt_scan(self):
+        """Hunt mode: re-price the watchlist and buy tokens that are pumping."""
+        while True:
+            t = time.time()
+            for mint in list(self.watch):
+                w = self.watch[mint]
+                if t - w["first_seen"] > HUNT_MAX_AGE:
+                    self.watch.pop(mint, None)
+                    continue
+                c = await self.get_curve(w["curve"])
+                if c == "GONE" or (isinstance(c, dict) and c["complete"]):
+                    self.watch.pop(mint, None)
+                    continue
+                if not isinstance(c, dict):
+                    continue
+                w["prices"].append((t, spot_price(c)))
+                w["prices"] = w["prices"][-40:]
+                for st in self.strategies:
+                    self.try_enter_hunt(st, mint, w, c)
+            await self.broadcast()
+            await asyncio.sleep(HUNT_SCAN_SEC)
 
     def parse_events(self, logs):
         """Read the CreateEvent (mint, curve) and the dev's bundled buy straight
@@ -342,26 +412,81 @@ class Pool:
                     "creator": creator or mint, "dev_buy_sol": dev}
         return None
 
+    async def get_top_holder_pct(self, mint):
+        """Approx: biggest non-curve holder's share of circulating supply, at entry.
+        The bonding curve holds the most supply, so we exclude the single largest
+        account and measure the next-largest against the rest. Higher = riskier."""
+        res = await self.rpc("getTokenLargestAccounts", [mint, {"commitment": "processed"}])
+        if not res or not res.get("value"):
+            return None
+        amts = sorted((int(a["amount"]) for a in res["value"]), reverse=True)
+        if len(amts) < 2:
+            return 0.0
+        circulating = sum(amts) - amts[0]      # exclude the curve (largest)
+        if circulating <= 0:
+            return 0.0
+        return amts[1] / circulating * 100
+
+    def _enter(self, st, mint, curve, c):
+        """Open a simulated position in `mint` against curve state `c`."""
+        sol_in = int((TRADE_EUR / self.sol_eur) * LAMPORTS)
+        tokens = buy_quote(c, sol_in)
+        if tokens <= 0:
+            return
+        st.cash -= TRADE_EUR
+        st.positions[mint] = {
+            "mint": mint, "curve": curve, "tokens": tokens,
+            "cost_eur": TRADE_EUR, "entry_ts": time.time(), "value_eur": TRADE_EUR,
+        }
+
     def try_enter(self, st, info, p0, p1, c1):
+        """Snipe / smart entry: decide at launch whether to buy."""
         mint = info["mint"]
         g = st.genome
         if mint in st.positions or st.cash < TRADE_EUR:
             return
         if len(st.positions) >= MAX_POS_PER_STRAT:
             return
-        if info["dev_buy_sol"] is not None and info["dev_buy_sol"] > g["dev_max"]:
-            return                                      # filter: dev grabbed too much
-        if p0 > 0 and p1 > 0 and (p1 / p0 - 1) > g["slip"] / 100:
+        dev = info.get("dev_buy_sol")
+        if dev is not None:
+            if "dev_max" in g and dev > g["dev_max"]:
+                return                                  # dev grabbed too much
+            if "dev_min" in g and dev < g["dev_min"]:
+                return                                  # dev has no skin in the game
+        if "top_hold_max" in g and info.get("top_hold") is not None:
+            if info["top_hold"] > g["top_hold_max"]:
+                return                                  # supply too concentrated
+        if "slip" in g and p0 > 0 and p1 > 0 and (p1 / p0 - 1) > g["slip"] / 100:
             return                                      # too much run-up = would miss
-        sol_in = int((TRADE_EUR / self.sol_eur) * LAMPORTS)
-        tokens = buy_quote(c1, sol_in)
-        if tokens <= 0:
+        self._enter(st, mint, info["curve"], c1)
+
+    def try_enter_hunt(self, st, mint, w, c):
+        """Hunt entry: buy a token that already exists if it's pumping."""
+        g = st.genome
+        if mint in st.positions or st.cash < TRADE_EUR:
             return
-        st.cash -= TRADE_EUR
-        st.positions[mint] = {
-            "mint": mint, "curve": info["curve"], "tokens": tokens,
-            "cost_eur": TRADE_EUR, "entry_ts": time.time(), "value_eur": TRADE_EUR,
-        }
+        if len(st.positions) >= MAX_POS_PER_STRAT:
+            return
+        dev = w.get("dev_buy")
+        if dev is not None and "dev_max" in g and dev > g["dev_max"]:
+            return
+        mom = self._momentum(w, g["mom_window"])
+        if mom is None or mom < g["mom_pct"] / 100:
+            return                                      # not pumping enough yet
+        self._enter(st, mint, w["curve"], c)
+
+    @staticmethod
+    def _momentum(w, window_sec):
+        prices = w["prices"]
+        if len(prices) < 2:
+            return None
+        now_t, now_p = prices[-1]
+        past = prices[0]
+        for t, p in prices:
+            if t <= now_t - window_sec:
+                past = (t, p)
+        pp = past[1]
+        return (now_p / pp - 1) if pp > 0 else None
 
     def close(self, st, mint, proceeds, reason):
         pos = st.positions.pop(mint)
@@ -515,6 +640,7 @@ class Pool:
             "generation": self.generation, "pool": len(self.strategies),
             "sol_eur": round(self.sol_eur, 2), "trade_eur": TRADE_EUR,
             "start_cash": START_CASH_EUR, "day_index": self.day_index,
+            "mode": BOT_MODE, "watch": len(self.watch),
             "evolve_in": max(0, int(EVOLVE_INTERVAL_SEC - (t - self.last_evolve))),
             "champion": board[0] if board else None, "board": board,
             "best_ever": self.best_ever, "ledger": list(self.ledger)[:30],
@@ -619,6 +745,61 @@ class Pool:
 
 
 # ---------------------------------------------------------------------------
+# League: aggregate several bot instances into one table
+# ---------------------------------------------------------------------------
+class League:
+    def __init__(self, session):
+        self.s = session
+        self.data = {}          # label -> summary dict
+        self.clients = set()
+
+    async def reset(self):      # no-op so the shared /api/reset handler is happy
+        pass
+
+    async def poll(self):
+        while True:
+            for label, base in PEERS:
+                url = base + "/api/state" + (f"?k={ACCESS_TOKEN}" if ACCESS_TOKEN else "")
+                try:
+                    async with self.s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        st = await r.json()
+                    champ = st.get("champion") or {}
+                    be = st.get("best_ever") or {}
+                    self.data[label] = {
+                        "mode": st.get("mode"), "ok": True,
+                        "champ_eq": champ.get("equity"),
+                        "genome": champ.get("genome") or {},
+                        "total_realized": st.get("total_realized"),
+                        "day": st.get("day_index"), "pool": st.get("pool"),
+                        "best_cum": be.get("cum_pnl"),
+                        "start_cash": st.get("start_cash", 1000),
+                    }
+                except Exception as e:
+                    self.data[label] = {"ok": False, "err": str(e)[:70]}
+            await self.broadcast()
+            await asyncio.sleep(10)
+
+    def snapshot(self):
+        rows = []
+        for label, base in PEERS:
+            d = self.data.get(label, {"ok": False, "err": "no data yet"})
+            rows.append({"label": label, "url": base, **d})
+        rows.sort(key=lambda r: (r.get("total_realized") if r.get("ok") else -9e9),
+                  reverse=True)
+        return {"mode": "league", "rows": rows, "peers": len(PEERS)}
+
+    async def broadcast(self):
+        if not self.clients:
+            return
+        msg = json.dumps(self.snapshot())
+        for ws in list(self.clients):
+            try:
+                await ws.send_str(msg)
+            except Exception:
+                self.clients.discard(ws)
+
+
+# ---------------------------------------------------------------------------
 # Solana subscription
 # ---------------------------------------------------------------------------
 async def solana_stream(pool):
@@ -665,7 +846,8 @@ _DENY = "Unauthorized — add ?k=YOUR_TOKEN to the URL"
 async def h_index(request):
     if not authed(request):
         return web.Response(status=401, text=_DENY)
-    return web.Response(text=PAGE, content_type="text/html")
+    return web.Response(text=(LEAGUE_PAGE if BOT_MODE == "league" else PAGE),
+                        content_type="text/html")
 
 
 async def h_state(request):
@@ -699,6 +881,11 @@ async def h_ws(request):
 
 async def on_startup(app):
     app["session"] = aiohttp.ClientSession()
+    if BOT_MODE == "league":
+        league = League(app["session"])
+        app["pool"] = league
+        app["tasks"] = [asyncio.create_task(league.poll())]
+        return
     pool = Pool(app["session"])
     pool.load()
     app["pool"] = pool
@@ -707,6 +894,8 @@ async def on_startup(app):
         asyncio.create_task(pool.tracker()),
         asyncio.create_task(pool.price_feed()),
     ]
+    if BOT_MODE == "hunt":
+        app["tasks"].append(asyncio.create_task(pool.hunt_scan()))
 
 
 async def on_cleanup(app):
@@ -804,7 +993,7 @@ PAGE = r"""<!doctype html>
   .foot{color:var(--mut);font-size:11px;margin-top:22px;line-height:1.5}
 </style></head>
 <body>
-<div class="sim">simulated cash · evolving strategy pool · no real money</div>
+<div class="sim" id="modebadge">simulated cash · evolving strategy pool · no real money</div>
 
 <div class="hero">
   <div class="hlabel"><span class="crown">♛</span> Best strategy right now</div>
@@ -854,10 +1043,23 @@ function short(a){return a.slice(0,4)+"…"+a.slice(-4)}
 function coin(m,label){return `<a class="coin" target="_blank" rel="noopener" href="https://pump.fun/coin/${m}">${label||short(m)}</a>`}
 const REASON={tp:"2× hit",sl:"stopped out",timeout:"timed out",rug:"rugged",
   dead:"went dead",graduated:"graduated",manual:"sold"};
+const GLABEL={tp:'take',sl:'stop',hold:'hold',slip:'slip',dev_max:'dev ≤',
+  dev_min:'dev ≥',top_hold_max:'top ≤',mom_pct:'pump ≥',mom_window:'window'};
+function gval(k,v){
+  if(k==='sl')return Math.round(v*100)+'%';
+  if(k==='tp')return v+'×';
+  if(k==='hold'||k==='mom_window')return v+'s';
+  if(k==='dev_max'||k==='dev_min')return v+'◎';
+  return v+'%';
+}
 function chip(l,v){return `<div class="gene"><span class="gl">${l}</span><span class="gv">${v}</span></div>`}
-function genes(g){return `<div class="genes">${chip("take",g.tp+"×")}${chip("stop",Math.round(g.sl*100)+"%")}${chip("hold",g.hold+"s")}${chip("dev ≤",g.dev_max+"◎")}${chip("slip",g.slip+"%")}</div>`}
+function genes(g){return `<div class="genes">`+Object.keys(g).map(k=>chip(GLABEL[k]||k,gval(k,g[k]))).join('')+`</div>`}
+function genesShort(g){return Object.keys(g).map(k=>(GLABEL[k]||k)+' '+gval(k,g[k])).join(' · ')}
 
 function render(s){
+  const MODES={snipe:"🎯 SNIPER (basic)",smart:"🛡️ SMART SNIPER (anti-rug)",hunt:"📈 HUNTER (momentum)"};
+  document.getElementById("modebadge").textContent=
+    (MODES[s.mode]||s.mode)+" · simulated cash · no real money"+(s.mode==="hunt"?" · watching "+s.watch:"");
   const c=s.champion;
   if(c){
     document.getElementById("champEq").textContent=eur(c.equity);
@@ -881,10 +1083,10 @@ function render(s){
     : '<div class="empty">Fills in after the first daily evolve…</div>';
 
   document.getElementById("ledger").innerHTML = (s.ledger&&s.ledger.length)?
-    s.ledger.map(d=>{const g=d.genome;
+    s.ledger.map(d=>{
       return `<div class="lrow"><span class="lday">Day ${d.day}</span>
         <span class="gene" style="flex-direction:row;gap:6px;padding:4px 8px">
-          <span class="gv">${g.tp}× · ${Math.round(g.sl*100)}% · ${g.hold}s · dev${g.dev_max} · slip${g.slip}</span></span>
+          <span class="gv">${genesShort(d.genome)}</span></span>
         <span class="mono ${d.day_pnl>=0?'up':'down'}">${sgn(d.day_pnl)}€</span>
         <span class="rt">#${d.combo_id}${d.days_alive>1?' · '+d.days_alive+'d streak':''}</span></div>`}).join("")
     : '<div class="empty">No days completed yet…</div>';
@@ -947,9 +1149,91 @@ connect();
 </body></html>"""
 
 
+LEAGUE_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>bot league</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#0d0f1a;--panel:#151932;--panel2:#1a1f3d;--line:#262c4a;--ink:#eceefb;
+    --mut:#868cb2;--gain:#38e0b0;--loss:#ff7a8a;--accent:#7c6cff;--gold:#f5c451}
+  *{box-sizing:border-box}
+  body{margin:0 auto;background:var(--bg);color:var(--ink);font-family:Archivo,system-ui,sans-serif;
+    padding:18px 14px 60px;max-width:680px;-webkit-font-smoothing:antialiased}
+  .mono{font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+  .up{color:var(--gain)}.down{color:var(--loss)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    padding:16px;margin-bottom:12px}
+  .card.win{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold) inset}
+  .top{display:flex;align-items:baseline;gap:10px}
+  .medal{font-size:18px}
+  .name{font-size:16px;font-weight:700}
+  .big{margin-left:auto;font-family:"JetBrains Mono",monospace;font-weight:700;font-size:22px}
+  .kv{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12.5px;color:var(--mut)}
+  .kv b{color:var(--ink);font-weight:600}
+  .genes{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
+  .gene{font-family:"JetBrains Mono",monospace;font-size:11.5px;background:var(--bg);
+    border:1px solid var(--line);border-radius:8px;padding:4px 8px;color:#a99bff}
+  .err{color:var(--loss);font-size:12px;margin-top:8px}
+  .empty{color:var(--mut);font-size:13px;padding:14px 2px}
+  .foot{color:var(--mut);font-size:11px;margin-top:20px;line-height:1.5}
+</style></head>
+<body>
+<h1>🏁 Bot league</h1>
+<div class="sub" id="sub">which brain is winning · simulated cash</div>
+<div id="rows"><div class="empty">Fetching the bots…</div></div>
+<div class="foot">Each bot runs the same evolutionary engine on a different strategy.
+Ranked by total realized P&amp;L. Numbers are simulated — a leader here is a
+hypothesis, not proof it works with real money.</div>
+<script>
+const K=new URLSearchParams(location.search).get('k')||'';
+const Q=K?('?k='+encodeURIComponent(K)):'';
+const MODES={snipe:"🎯 Sniper",smart:"🛡️ Smart sniper",hunt:"📈 Hunter"};
+const GLABEL={tp:'take',sl:'stop',hold:'hold',slip:'slip',dev_max:'dev ≤',
+  dev_min:'dev ≥',top_hold_max:'top ≤',mom_pct:'pump ≥',mom_window:'window'};
+function gval(k,v){if(k==='sl')return Math.round(v*100)+'%';if(k==='tp')return v+'×';
+  if(k==='hold'||k==='mom_window')return v+'s';if(k==='dev_max'||k==='dev_min')return v+'◎';return v+'%';}
+function sgn(n){return (n>=0?"+":"")+Number(n).toFixed(2)}
+const MEDAL=["🥇","🥈","🥉"];
+function render(s){
+  document.getElementById("sub").textContent=
+    s.peers+" bots · which brain is winning · simulated cash";
+  if(!s.rows.length){document.getElementById("rows").innerHTML=
+    '<div class="empty">No bots configured. Set the PEERS variable.</div>';return;}
+  document.getElementById("rows").innerHTML=s.rows.map((r,i)=>{
+    if(!r.ok) return `<div class="card"><div class="top"><span class="name">${r.label}</span></div>
+      <div class="err">can't reach this bot: ${r.err||''}</div></div>`;
+    const pnl=r.total_realized||0, cl=pnl>=0?"up":"down";
+    const g=r.genome||{};
+    const chips=Object.keys(g).map(k=>`<span class="gene">${GLABEL[k]||k} ${gval(k,g[k])}</span>`).join("");
+    return `<div class="card ${i===0?'win':''}">
+      <div class="top"><span class="medal">${MEDAL[i]||''}</span>
+        <span class="name">${r.label} · ${MODES[r.mode]||r.mode||''}</span>
+        <span class="big ${cl}">${sgn(pnl)}€</span></div>
+      <div class="kv"><span>champion equity <b class="mono">€${(r.champ_eq||0).toFixed(2)}</b></span>
+        <span>best combo <b class="mono ${(r.best_cum||0)>=0?'up':'down'}">${r.best_cum!=null?sgn(r.best_cum)+'€':'—'}</b></span>
+        <span>day <b class="mono">${r.day||0}</b></span>
+        <span>pool <b class="mono">${r.pool||0}</b></span></div>
+      <div class="genes">${chips}</div></div>`}).join("");
+}
+function connect(){
+  const proto=location.protocol==="https:"?"wss:":"ws:";
+  const ws=new WebSocket(proto+"//"+location.host+"/ws"+Q);
+  ws.onmessage=e=>render(JSON.parse(e.data));
+  ws.onclose=()=>setTimeout(connect,1500);
+}
+connect();
+</script>
+</body></html>"""
+
+
 if __name__ == "__main__":
     print(f"HTTP {RPC_HTTP}\nWSS  {RPC_WSS}")
-    print(f"pool={POOL_SIZE}  evolve every {EVOLVE_INTERVAL_SEC}s  "
+    print(f"BOT_MODE={BOT_MODE}  pool={POOL_SIZE}  evolve every {EVOLVE_INTERVAL_SEC}s  "
           f"trade=€{TRADE_EUR}  dashboard -> http://localhost:{PORT}")
     print(f"state file: {STATE_PATH!r}   trades: {CSV_PATH!r}")
     print("SIMULATED CASH ONLY — no wallet, no real trades\n")
