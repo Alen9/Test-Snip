@@ -119,7 +119,7 @@ _MODE_GENES = {
               "mom_pct": (5.0, 80.0),   # only buy if price pumped at least this % ...
               "mom_window": (10, 120)}, # ... within this many seconds
 }
-GENE_BOUNDS = _MODE_GENES[BOT_MODE]
+GENE_BOUNDS = _MODE_GENES.get(BOT_MODE, _MODE_GENES["snipe"])
 _INT_GENES = ("hold", "mom_window")
 
 
