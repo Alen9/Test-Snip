@@ -1233,8 +1233,10 @@ connect();
 
 if __name__ == "__main__":
     print(f"HTTP {RPC_HTTP}\nWSS  {RPC_WSS}")
-    print(f"BOT_MODE={BOT_MODE}  pool={POOL_SIZE}  evolve every {EVOLVE_INTERVAL_SEC}s  "
-          f"trade=€{TRADE_EUR}  dashboard -> http://localhost:{PORT}")
+    _kt = RPC_HTTP.split("api-key=")[-1][-4:] if "api-key=" in RPC_HTTP else "n/a"
+    print(f"BOT_MODE={BOT_MODE}  rpc key ...{_kt}  pool={POOL_SIZE}  "
+          f"evolve every {EVOLVE_INTERVAL_SEC}s  trade=€{TRADE_EUR}  "
+          f"dashboard -> http://localhost:{PORT}")
     print(f"state file: {STATE_PATH!r}   trades: {CSV_PATH!r}")
     print("SIMULATED CASH ONLY — no wallet, no real trades\n")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
