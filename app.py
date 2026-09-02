@@ -584,12 +584,8 @@ class Pool:
                     if c == "GONE":                       # curve account gone = rug
                         self.close(st, mint, 0.0, "rug")
                         continue
-                    if not isinstance(c, dict):           # transient read failure
-                        pos["fails"] = pos.get("fails", 0) + 1
-                        if pos["fails"] >= 4:             # unreadable too long = dead
-                            self.close(st, mint, 0.0, "dead")
-                        continue
-                    pos["fails"] = 0
+                    if not isinstance(c, dict):           # read failed (throttle/blip)
+                        continue                          # skip; retry next cycle, never fake a loss
                     val = (sell_quote(c, pos["tokens"]) / LAMPORTS) * self.sol_eur
                     pos["value_eur"] = val
                     held = time.time() - pos["entry_ts"]
