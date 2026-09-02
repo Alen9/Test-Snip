@@ -855,13 +855,14 @@ class League:
 # Solana subscription
 # ---------------------------------------------------------------------------
 async def pumpportal_stream(pool):
-    backoff = 2
+    headers = {"User-Agent": "Mozilla/5.0", "Origin": "https://pumpportal.fun"}
+    backoff = 5
     while True:
         try:
             async with pool.s.ws_connect(PUMPPORTAL_WSS, max_msg_size=0,
-                                         heartbeat=30) as ws:
+                                         heartbeat=30, headers=headers) as ws:
                 await ws.send_str(json.dumps({"method": "subscribeNewToken"}))
-                backoff = 2
+                backoff = 5
                 print("subscribed to pump.fun launches (via PumpPortal, free)",
                       flush=True)
                 async for msg in ws:
@@ -879,9 +880,11 @@ async def pumpportal_stream(pool):
                         if info:
                             asyncio.create_task(pool.on_new_token(info))
         except Exception as e:
-            print(f"[pumpportal reconnect in {backoff}s] {e}", flush=True)
+            hint = ("  (looks like a PumpPortal timeout — bans last ~1h and only ONE "
+                    "connection is allowed) ") if "502" in str(e) else ""
+            print(f"[pumpportal reconnect in {backoff}s] {e}{hint}", flush=True)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, 300)          # up to 5 min so a ban can expire
 
 
 async def solana_stream(pool):
