@@ -45,14 +45,14 @@ RPC_WSS = os.environ.get("RPC_WSS", "wss://mainnet.helius-rpc.com/?api-key=b842b
 PORT = int(os.environ.get("PORT", "8080"))
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")  # set on Railway to lock the dashboard
 
-START_CASH_EUR = float(os.environ.get("START_CASH_EUR", "1000"))
-TRADE_EUR = float(os.environ.get("TRADE_EUR", "10"))
+START_CASH_EUR = float(os.environ.get("START_CASH_EUR", "100000"))
+TRADE_EUR = float(os.environ.get("TRADE_EUR", "50"))
 SIM_LATENCY_MS = int(os.environ.get("SIM_LATENCY_MS", "600"))
 FEE_BPS = 100
 
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "12"))
 EVOLVE_INTERVAL_SEC = int(os.environ.get("EVOLVE_INTERVAL_SEC", "3600"))  # 1h; 86400 = per day
-MAX_POS_PER_STRAT = int(os.environ.get("MAX_POS_PER_STRAT", "15"))
+MAX_POS_PER_STRAT = int(os.environ.get("MAX_POS_PER_STRAT", "40"))
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "3"))  # raise to 6-8 on free RPC
 
 # Which brain this instance runs: "snipe" (basic), "smart" (anti-rug filters),
