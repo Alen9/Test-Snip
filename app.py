@@ -92,6 +92,11 @@ try:
 except Exception as _e:
     print(f"[init] could not create save dir: {_e}", flush=True)
 
+# Where launch data comes from. "pumpportal" = free purpose-built pump.fun feed
+# (no key, no Helius credits burned). "helius" = old firehose (expensive).
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "pumpportal").strip().lower()
+PUMPPORTAL_WSS = os.environ.get("PUMPPORTAL_WSS", "wss://pumpportal.fun/api/data")
+
 # ---------------------------------------------------------------------------
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes([24, 30, 200, 40, 5, 28, 7, 119])
@@ -184,6 +189,29 @@ def spot_price(c):
     if not isinstance(c, dict) or c["vt"] == 0:
         return 0.0
     return (c["vs"] / LAMPORTS) / (c["vt"] / TOKEN_UNITS)
+
+
+def parse_pp_token(d):
+    """Parse a PumpPortal subscribeNewToken event into our launch shape.
+    Its payload carries the mint, bonding curve, virtual reserves (= price)
+    and the dev's SOL buy — so we can enter with no RPC call at all."""
+    mint = d.get("mint")
+    curve = d.get("bondingCurveKey") or d.get("bonding_curve")
+    if not mint or not curve:
+        return None
+    dev = d.get("solAmount")
+    info = {"mint": mint, "curve": curve,
+            "creator": d.get("traderPublicKey") or mint,
+            "dev_buy_sol": float(dev) if dev is not None else None}
+    vt = d.get("vTokensInBondingCurve")
+    vs = d.get("vSolInBondingCurve")
+    try:
+        if vt and vs:
+            info["reserves"] = {"vt": int(float(vt) * TOKEN_UNITS),
+                                "vs": int(float(vs) * LAMPORTS), "complete": False}
+    except (TypeError, ValueError):
+        pass
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +381,34 @@ class Pool:
             info["top_hold"] = await self.get_top_holder_pct(info["mint"])
         for st in self.strategies:
             self.try_enter(st, info, p0, p1, c1)
+        await self.broadcast()
+
+    async def on_new_token(self, info):
+        """PumpPortal path: launch data (incl. price + dev buy) comes in the
+        event, so entry costs no RPC. Only open positions later cost reads."""
+        info["age"] = time.time()
+        self.launches.appendleft(info)
+        await self.broadcast()
+
+        if BOT_MODE == "hunt":
+            w = {"curve": info["curve"], "first_seen": time.time(),
+                 "prices": [], "dev_buy": info["dev_buy_sol"]}
+            if info.get("reserves"):
+                w["prices"].append((time.time(), spot_price(info["reserves"])))
+            self.watch[info["mint"]] = w
+            while len(self.watch) > HUNT_WATCH_MAX:
+                oldest = min(self.watch, key=lambda m: self.watch[m]["first_seen"])
+                self.watch.pop(oldest, None)
+            return
+
+        c1 = info.get("reserves") or await self.get_curve(info["curve"])
+        if not isinstance(c1, dict) or c1.get("complete"):
+            return
+        price = spot_price(c1)
+        if BOT_MODE == "smart":
+            info["top_hold"] = await self.get_top_holder_pct(info["mint"])
+        for st in self.strategies:
+            self.try_enter(st, info, price, price, c1)   # p0=p1 → slip gene inert here
         await self.broadcast()
 
     async def hunt_scan(self):
@@ -802,14 +858,46 @@ class League:
 # ---------------------------------------------------------------------------
 # Solana subscription
 # ---------------------------------------------------------------------------
+async def pumpportal_stream(pool):
+    backoff = 2
+    while True:
+        try:
+            async with pool.s.ws_connect(PUMPPORTAL_WSS, max_msg_size=0,
+                                         heartbeat=30) as ws:
+                await ws.send_str(json.dumps({"method": "subscribeNewToken"}))
+                backoff = 2
+                print("subscribed to pump.fun launches (via PumpPortal, free)",
+                      flush=True)
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        d = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    # ignore the subscribe-confirmation and anything without a mint
+                    if d.get("mint") and (d.get("bondingCurveKey") or d.get("bonding_curve")):
+                        info = parse_pp_token(d)
+                        if info:
+                            asyncio.create_task(pool.on_new_token(info))
+        except Exception as e:
+            print(f"[pumpportal reconnect in {backoff}s] {e}", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
 async def solana_stream(pool):
     sub = {"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
            "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "processed"}]}
+    backoff = 2
     while True:
         try:
             async with pool.s.ws_connect(RPC_WSS, max_msg_size=0) as ws:
                 await ws.send_str(json.dumps(sub))
                 await ws.receive()
+                backoff = 2                        # reset once connected
                 print("subscribed to pump.fun launches", flush=True)
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
@@ -826,8 +914,9 @@ async def solana_stream(pool):
                         asyncio.create_task(pool.on_signature(
                             v["signature"], detected_at, v.get("logs", [])))
         except Exception as e:
-            print(f"[reconnect] {e}", flush=True)
-            await asyncio.sleep(2)
+            print(f"[reconnect in {backoff}s] {e}", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)          # ease off instead of hammering
 
 
 # ---------------------------------------------------------------------------
@@ -889,8 +978,9 @@ async def on_startup(app):
     pool = Pool(app["session"])
     pool.load()
     app["pool"] = pool
+    stream = pumpportal_stream if DATA_SOURCE == "pumpportal" else solana_stream
     app["tasks"] = [
-        asyncio.create_task(solana_stream(pool)),
+        asyncio.create_task(stream(pool)),
         asyncio.create_task(pool.tracker()),
         asyncio.create_task(pool.price_feed()),
     ]
@@ -1234,7 +1324,7 @@ connect();
 if __name__ == "__main__":
     print(f"HTTP {RPC_HTTP}\nWSS  {RPC_WSS}")
     _kt = RPC_HTTP.split("api-key=")[-1][-4:] if "api-key=" in RPC_HTTP else "n/a"
-    print(f"BOT_MODE={BOT_MODE}  rpc key ...{_kt}  pool={POOL_SIZE}  "
+    print(f"BOT_MODE={BOT_MODE}  data={DATA_SOURCE}  rpc key ...{_kt}  pool={POOL_SIZE}  "
           f"evolve every {EVOLVE_INTERVAL_SEC}s  trade=€{TRADE_EUR}  "
           f"dashboard -> http://localhost:{PORT}")
     print(f"state file: {STATE_PATH!r}   trades: {CSV_PATH!r}")
