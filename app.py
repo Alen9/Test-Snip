@@ -931,6 +931,10 @@ def authed(request):
 _DENY = "Unauthorized — add ?k=YOUR_TOKEN to the URL"
 
 
+async def h_health(request):
+    return web.Response(text="ok")            # public, no auth — for Railway healthchecks
+
+
 async def h_index(request):
     if not authed(request):
         return web.Response(status=401, text=_DENY)
@@ -997,6 +1001,7 @@ def make_app():
     app = web.Application()
     app.add_routes([
         web.get("/", h_index),
+        web.get("/health", h_health),
         web.get("/api/state", h_state),
         web.post("/api/reset", h_reset),
         web.get("/ws", h_ws),
