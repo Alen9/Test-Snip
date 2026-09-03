@@ -827,14 +827,13 @@ PAGE = r"""<!doctype html>
 <div class="tabs" id="tabs"></div>
 <div id="view"></div>
 <div class="foot" id="foot"></div>
-<canvas id="chart" height="150" style="display:none"></canvas>
 <script>
 const K=new URLSearchParams(location.search).get('k')||'';
 const Q=K?('?k='+encodeURIComponent(K)):'';
 const MODES={snipe:"🎯 Sniper",smart:"🛡️ Smart",hunt:"📈 Hunter"};
 const GLABEL={tp:'take',sl:'stop',hold:'hold',dev_max:'dev ≤',dev_min:'dev ≥',
   top_hold_max:'top ≤',mom_pct:'pump ≥',mom_window:'window'};
-let S=null, tab='league', chart=null;
+let S=null, tab='league', chart=null, _timer=null;
 function eur(n){return "€"+Number(n).toFixed(2)}
 function sgn(n){return (n>=0?"+":"")+Number(n).toFixed(2)}
 function pct(n){return (n>=0?"+":"")+Math.round(n)+"%"}
@@ -855,18 +854,17 @@ function drawTabs(){
 function pick(x){tab=x;draw();}
 
 function draw(){
-  drawTabs();
-  const v=document.getElementById('view');
-  document.getElementById('chart').style.display='none';
-  if(tab==='league'){ v.innerHTML=leagueHTML(); document.getElementById('foot').textContent=
-    'Ranked by total realised P&L. Simulated — a leader is a hypothesis, not proof.'; return; }
-  const p=S.pools[tab]; if(!p){v.innerHTML='<div class="empty">no data</div>';return;}
-  v.innerHTML=poolHTML(p);
-  const cv=document.getElementById('chart'); cv.style.display='block';
-  document.getElementById('view').appendChild(cv);
-  drawChart(p.pv);
-  document.getElementById('foot').textContent=
-    `${MODES[tab]||tab} · pool P&L ${sgn(p.total_realized)}€ · SOL €${p.sol_eur} · simulated`;
+  try{
+    drawTabs();
+    const v=document.getElementById('view');
+    if(tab==='league'){ v.innerHTML=leagueHTML(); document.getElementById('foot').textContent=
+      'Ranked by total realised P&L. Simulated — a leader is a hypothesis, not proof.'; return; }
+    const p=S.pools[tab]; if(!p){v.innerHTML='<div class="empty">no data</div>';return;}
+    v.innerHTML=poolHTML(p);
+    drawChart(p.pv);
+    document.getElementById('foot').textContent=
+      `${MODES[tab]||tab} · pool P&L ${sgn(p.total_realized)}€ · SOL €${p.sol_eur} · simulated`;
+  }catch(e){ console.error('draw error', e); }
 }
 
 function leagueHTML(){
@@ -892,7 +890,7 @@ function poolHTML(p){
       <span>day <b class="mono">${p.day_index}</b></span>
       <span>evolves in <b class="mono">${Math.floor(p.evolve_in/3600)}h</b></span>
       <button class="reset" onclick="resetMode('${p.mode}')">Reset ${p.mode}</button></div></div>`;
-  h+='<h2>Portfolio value</h2>';
+  h+='<h2>Portfolio value</h2><canvas id="chart" height="150"></canvas>';
   const be=p.best_ever;
   h+='<h2>🏆 Hall of fame</h2>'+(be?`<div class="hof"><div class="hlabel">combo #${be.combo_id} · best ever</div>
     <div class="big ${be.cum_pnl>=0?'up':'down'}">${sgn(be.cum_pnl)}€</div>${genes(be.genome)}
@@ -923,8 +921,9 @@ function poolHTML(p){
 }
 
 function drawChart(pv){
-  const cv=document.getElementById('chart'); const data=(pv||[]).map(p=>p.v);
-  if(chart){chart.destroy();}
+  const cv=document.getElementById('chart'); if(!cv) return;
+  const data=(pv||[]).map(p=>p.v);
+  if(chart){try{chart.destroy();}catch(e){}}
   chart=new Chart(cv,{type:'line',data:{labels:data.map(_=>''),datasets:[{data,
     borderColor:'#f5c451',borderWidth:2,fill:true,backgroundColor:'rgba(245,196,81,.1)',
     tension:.25,pointRadius:0}]},options:{animation:false,plugins:{legend:{display:false}},
