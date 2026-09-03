@@ -1,0 +1,8 @@
+MODES=snipe,smart,hunt
+RPC_HTTP=https://lb.drpc.live/solana/AoENyGKaVU0JlKD4j7yODKDSPit0pqcR8bHd0neqFxjy
+ACCESS_TOKEN=CHANGE_ME_pick_any_long_secret_word
+EVOLVE_INTERVAL_SEC=86400
+POLL_INTERVAL_SEC=20
+START_CASH_EUR=100000
+TRADE_EUR=50
+PORT=80
