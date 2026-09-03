@@ -640,12 +640,13 @@ def combined_snapshot(app):
     snaps = {m: pools[m].snapshot() for m in pools}
     league = sorted(
         [{"mode": m, "total_realized": s["total_realized"],
+          "champ_pnl": s["champion"]["realized"] if s["champion"] else 0,
           "champ_eq": s["champion"]["equity"] if s["champion"] else 0,
           "best_cum": (s["best_ever"] or {}).get("cum_pnl"),
           "day": s["day_index"], "pool": s["pool"],
           "genome": s["champion"]["genome"] if s["champion"] else {}}
          for m, s in snaps.items()],
-        key=lambda x: x["total_realized"], reverse=True)
+        key=lambda x: x["champ_pnl"], reverse=True)
     return {"modes": list(pools.keys()), "pools": snaps, "league": league,
             "sol_eur": next(iter(snaps.values()))["sol_eur"] if snaps else 0}
 
@@ -932,7 +933,14 @@ function drawChart(pv){
 async function resetMode(m){if(confirm('Reset '+m+' back to fresh random strategies?'))
   await fetch('/api/reset'+Q,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})});}
 
-function render(s){S=s; if(tab!=='league'&&!s.modes.includes(tab))tab='league'; draw();}
+function render(s){
+  const first=(S===null);
+  S=s;
+  if(tab!=='league' && !s.modes.includes(tab)) tab='league';
+  if(first){ draw(); return; }          // paint immediately on first load
+  if(_timer) return;                     // otherwise coalesce rapid updates
+  _timer=setTimeout(()=>{ _timer=null; draw(); }, 1200);
+}
 function connect(){const proto=location.protocol==='https:'?'wss:':'ws:';
   const ws=new WebSocket(proto+'//'+location.host+'/ws'+Q);
   ws.onmessage=e=>render(JSON.parse(e.data));ws.onclose=()=>setTimeout(connect,1500);}
