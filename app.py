@@ -55,6 +55,11 @@ POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "20"))
 HUNT_WATCH_MAX = int(os.environ.get("HUNT_WATCH_MAX", "20"))
 HUNT_MAX_AGE = int(os.environ.get("HUNT_MAX_AGE", "1800"))
 
+# Realistic loss handling for tokens the curve can't price honestly:
+STALE_SEC = int(os.environ.get("STALE_SEC", "600"))        # no price movement this long = dead
+BLIND_RECOVERY = float(os.environ.get("BLIND_RECOVERY", "0.10"))  # dead position recovers this frac of cost (=> -90%)
+GRAD_RECOVERY = float(os.environ.get("GRAD_RECOVERY", "0.70"))    # migrated token: capture this frac (timing/slippage)
+
 _VOL = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 STATE_DIR = _VOL if _VOL else "."
 try:
@@ -291,9 +296,11 @@ class Pool:
         if tokens <= 0:
             return
         st.cash -= TRADE_EUR
+        now = time.time()
         st.positions[mint] = {"mint": mint, "curve": curve, "tokens": tokens,
-                              "cost_eur": TRADE_EUR, "entry_ts": time.time(),
-                              "value_eur": TRADE_EUR}
+                              "cost_eur": TRADE_EUR, "entry_ts": now,
+                              "value_eur": TRADE_EUR, "last_val": TRADE_EUR,
+                              "last_change": now, "last_ok": now}
 
     def try_enter(self, st, info, c1):
         mint, g = info["mint"], st.genome
@@ -340,22 +347,38 @@ class Pool:
 
     # ---- valuation + exits (uses curves read once by the shared tracker) ----
     def value_and_exit(self, curves):
+        now = time.time()
         for st in self.strategies:
             g = st.genome
             for mint in list(st.positions):
                 pos = st.positions[mint]
                 c = curves.get(pos["curve"])
-                if c == "GONE":
+
+                if c == "GONE":                                  # curve account gone = rug
                     self.close(st, mint, 0.0, "rug")
                     continue
-                if not isinstance(c, dict):
+                if not isinstance(c, dict):                       # unreadable this cycle
+                    if now - pos["last_ok"] > STALE_SEC:          # blind too long = treat as dead
+                        self.close(st, mint, pos["cost_eur"] * BLIND_RECOVERY, "dead")
                     continue
+
                 val = (sell_quote(c, pos["tokens"]) / LAMPORTS) * self.sol_eur
+                if abs(val - pos["last_val"]) > 0.005 * pos["cost_eur"]:
+                    pos["last_change"] = now                       # price actually moved
+                pos["last_val"] = val
+                pos["last_ok"] = now
                 pos["value_eur"] = val
-                held = time.time() - pos["entry_ts"]
+                held = now - pos["entry_ts"]
                 ratio = val / pos["cost_eur"]
-                reason = ("graduated" if c["complete"]
-                          else "tp" if ratio >= g["tp"]
+
+                # price frozen for a long time = dead/untradeable (rug or migrated away)
+                if now - pos["last_change"] > STALE_SEC:
+                    self.close(st, mint, pos["cost_eur"] * BLIND_RECOVERY, "dead")
+                    continue
+                if c["complete"]:                                 # migrated: we go blind, haircut it
+                    self.close(st, mint, val * GRAD_RECOVERY, "graduated")
+                    continue
+                reason = ("tp" if ratio >= g["tp"]
                           else "sl" if ratio <= (1 - g["sl"])
                           else "timeout" if held >= g["hold"] else None)
                 if reason:
