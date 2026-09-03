@@ -680,8 +680,8 @@ async def h_health(request):
 
 
 async def h_index(request):
-    if not authed(request):
-        return web.Response(status=401, text=_DENY)
+    # Public shell (returns 200 for any probe). All DATA stays behind the token
+    # via /api/state and /ws, so this is not a data leak.
     return web.Response(text=PAGE, content_type="text/html")
 
 
