@@ -92,6 +92,10 @@ def csv_path(mode):
     return os.path.join(STATE_DIR, f"trades_{mode}.csv")
 
 
+def evolog_path(mode):
+    return os.path.join(STATE_DIR, f"evolution_{mode}.csv")
+
+
 # ---------------------------------------------------------------------------
 # Curve math
 # ---------------------------------------------------------------------------
@@ -441,8 +445,30 @@ class Pool:
                               "days_alive": champ.days_alive, "days_won": champ.days_won}
         self.generation += 1
         self.last_evolve = time.time()
+        self.evolog(winner)
         print(f"[{self.mode} evolve] day {self.day_index}: combo #{winner.combo_id} "
               f"day {winner.day_pnls[-1]:+.2f}€ cum {winner.cum_pnl:+.2f}€", flush=True)
+
+    def evolog(self, winner):
+        """Record how the pool evolved this day: the winning settings, its P&L,
+        and the pool-wide average of every gene (so you can see it drift)."""
+        try:
+            keys = list(self.gb.keys())
+            avg = {k: round(sum(s.genome.get(k, 0) for s in self.strategies)
+                            / len(self.strategies), 3) for k in keys}
+            p = evolog_path(self.mode)
+            new = not os.path.exists(p)
+            with open(p, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["date", "day", "winner_combo", "winner_day_pnl",
+                                "winner_cum_pnl", "winner_genome",
+                                "pool_avg_genome"])
+                w.writerow([now_date(), self.day_index, winner.combo_id,
+                            round(winner.day_pnls[-1], 2), round(winner.cum_pnl, 2),
+                            json.dumps(winner.genome), json.dumps(avg)])
+        except Exception as e:
+            print(f"[{self.mode} evolog] {e}", flush=True)
 
     def snapshot(self):
         board = []
@@ -870,13 +896,13 @@ function draw(){
 
 function leagueHTML(){
   const MED=["🥇","🥈","🥉"];
-  return '<h2>Which brain is winning</h2>'+S.league.map((r,i)=>{
-    const cl=r.total_realized>=0?'up':'down';
+  return '<h2>Best strategy per brain — how much its #1 made</h2>'+S.league.map((r,i)=>{
+    const cl=r.champ_pnl>=0?'up':'down';
     return `<div class="lgcard ${i===0?'win':''}">
       <div class="shead"><span class="medal">${MED[i]||''}</span>
         <span class="eq">${MODES[r.mode]||r.mode}</span>
-        <span class="pl mono ${cl}">${sgn(r.total_realized)}€</span></div>
-      <div class="smeta">champion equity ${eur(r.champ_eq)} · best combo ${r.best_cum!=null?sgn(r.best_cum)+'€':'—'} · day ${r.day}</div>
+        <span class="pl mono ${cl}">${sgn(r.champ_pnl)}€</span></div>
+      <div class="smeta">its #1 equity ${eur(r.champ_eq)} · day ${r.day}</div>
       ${genes(r.genome||{})}</div>`;}).join('')
     +`<div class="smeta" style="margin-top:10px">Tap a brain's tab above for its full board.</div>`;
 }
