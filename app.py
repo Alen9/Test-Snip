@@ -352,6 +352,9 @@ class Pool:
             g = st.genome
             for mint in list(st.positions):
                 pos = st.positions[mint]
+                pos.setdefault("last_ok", pos.get("entry_ts", now))
+                pos.setdefault("last_change", pos.get("entry_ts", now))
+                pos.setdefault("last_val", pos.get("value_eur", pos["cost_eur"]))
                 c = curves.get(pos["curve"])
 
                 if c == "GONE":                                  # curve account gone = rug
@@ -651,22 +654,25 @@ async def pumpportal_stream(app):
 async def shared_tracker(app):
     session, pools = app["session"], app["pools"]
     while True:
-        curves = {}
-        for p in pools.values():
-            for cv in p.curves_needed():
-                curves[cv] = None
-        for cv in list(curves):
-            curves[cv] = await get_curve(session, cv)
-        now = time.time()
-        for p in pools.values():
-            p.value_and_exit(curves)
-            if p.mode == "hunt":
-                p.hunt_check(curves, now)
-            p.pv.append({"t": int(now), "v": round(p.best_equity(), 2)})
-            if now - p.last_evolve >= EVOLVE_INTERVAL_SEC:
-                p.evolve()
-            p.save()
-        await broadcast_all(app)
+        try:
+            curves = {}
+            for p in pools.values():
+                for cv in p.curves_needed():
+                    curves[cv] = None
+            for cv in list(curves):
+                curves[cv] = await get_curve(session, cv)
+            now = time.time()
+            for p in pools.values():
+                p.value_and_exit(curves)
+                if p.mode == "hunt":
+                    p.hunt_check(curves, now)
+                p.pv.append({"t": int(now), "v": round(p.best_equity(), 2)})
+                if now - p.last_evolve >= EVOLVE_INTERVAL_SEC:
+                    p.evolve()
+                p.save()
+            await broadcast_all(app)
+        except Exception as e:
+            print(f"[tracker] {type(e).__name__}: {e}", flush=True)
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
 
