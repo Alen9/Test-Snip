@@ -108,6 +108,10 @@ def parse_curve(raw):
     if len(raw) < 49:
         return None
     vt, vs, rt, rs, ts = struct.unpack_from("<QQQQQ", raw, 8)
+    # sanity: a real pump.fun bonding curve is bounded. Reject garbage reads
+    # (wrong/invalid account) so they can't inflate a position to "millions".
+    if not (0 < vs <= 2_000 * LAMPORTS) or not (0 < vt <= 2_000_000_000 * TOKEN_UNITS):
+        return None
     return {"vt": vt, "vs": vs, "complete": bool(raw[48])}
 
 
@@ -366,6 +370,7 @@ class Pool:
                     continue
 
                 val = (sell_quote(c, pos["tokens"]) / LAMPORTS) * self.sol_eur
+                val = min(val, pos["cost_eur"] * 500)     # backstop: no position can 500x+
                 if abs(val - pos["last_val"]) > 0.005 * pos["cost_eur"]:
                     pos["last_change"] = now                       # price actually moved
                 pos["last_val"] = val
