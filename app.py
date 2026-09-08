@@ -535,7 +535,8 @@ class Pool:
         data = {"generation": self.generation, "last_evolve": self.last_evolve,
                 "next_id": self.next_id, "day_index": self.day_index,
                 "next_combo_id": self.next_combo_id, "ledger": list(self.ledger),
-                "best_ever": self.best_ever, "strategies": [
+                "best_ever": self.best_ever, "sol_eur": self.sol_eur,
+                "strategies": [
                     {"id": s.id, "genome": s.genome, "cash": s.cash,
                      "positions": s.positions, "realized": s.realized,
                      "trades": s.trades, "wins": s.wins,
@@ -595,7 +596,22 @@ class Pool:
         except Exception as e:
             print(f"[{self.mode} csv] {e}", flush=True)
 
-    def reset(self):
+    def reset(self, keep_top=0):
+        """Wipe cash/history back to a fresh baseline. If keep_top > 0, the
+        settings (genomes) of the current top strategies — plus the all-time
+        hall-of-fame genome — are carried forward into fresh €START_CASH
+        strategies with no positions and no history, so you can retest a
+        promising combo on honest, uncontaminated money. Everything else in
+        the pool still fills in randomly."""
+        seeds = []
+        if keep_top > 0 and self.strategies:
+            ranked = sorted(self.strategies, key=lambda s: self.equity(s), reverse=True)
+            seeds = [dict(s.genome) for s in ranked[:keep_top]]
+        if self.best_ever and self.best_ever.get("genome"):
+            g = dict(self.best_ever["genome"])
+            if g not in seeds:
+                seeds.insert(0, g)
+
         self.strategies = []
         self.next_id = self.next_combo_id = 1
         self.generation = 1
@@ -606,7 +622,9 @@ class Pool:
         self.ledger.clear()
         self.watch = {}
         self.best_ever = None
-        for _ in range(POOL_SIZE):
+        for g in seeds[:POOL_SIZE]:
+            self._new_strategy(g)
+        while len(self.strategies) < POOL_SIZE:
             self._new_strategy(rand_genome(self.gb))
         self.save()
 
@@ -767,10 +785,12 @@ async def h_state(request):
 async def h_reset(request):
     if not authed(request):
         return web.Response(status=401, text=_DENY)
-    mode = (await request.json()).get("mode")
+    body = await request.json()
+    mode = body.get("mode")
+    keep_top = int(body.get("keep_top", 0) or 0)
     pools = request.app["pools"]
     if mode in pools:
-        pools[mode].reset()
+        pools[mode].reset(keep_top=keep_top)
     await broadcast_all(request.app)
     return web.json_response({"ok": True})
 
@@ -962,7 +982,8 @@ function poolHTML(p){
     <div class="status"><span>gen <b class="mono">${p.generation}</b></span>
       <span>day <b class="mono">${p.day_index}</b></span>
       <span>evolves in <b class="mono">${Math.floor(p.evolve_in/3600)}h</b></span>
-      <button class="reset" onclick="resetMode('${p.mode}')">Reset ${p.mode}</button></div></div>`;
+      <button class="reset" onclick="resetMode('${p.mode}')">Reset ${p.mode}</button>
+      <button class="reset" onclick="resetKeepTop('${p.mode}')">Reset, keep best</button></div></div>`;
   h+='<h2>Portfolio value</h2><canvas id="chart" height="150"></canvas>';
   const be=p.best_ever;
   h+='<h2>🏆 Hall of fame</h2>'+(be?`<div class="hof"><div class="hlabel">combo #${be.combo_id} · best ever</div>
@@ -1004,6 +1025,12 @@ function drawChart(pv){
 }
 async function resetMode(m){if(confirm('Reset '+m+' back to fresh random strategies?'))
   await fetch('/api/reset'+Q,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})});}
+async function resetKeepTop(m){
+  const n=prompt('Reset '+m+' to fresh €100k cash, but carry forward the settings of how many top performers (plus the all-time best)? Rest of the pool fills in random.','3');
+  if(n===null) return;
+  const k=parseInt(n,10); if(isNaN(k)||k<0) return;
+  await fetch('/api/reset'+Q,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m,keep_top:k})});
+}
 
 function render(s){
   const first=(S===null);
