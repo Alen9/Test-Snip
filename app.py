@@ -596,21 +596,24 @@ class Pool:
         except Exception as e:
             print(f"[{self.mode} csv] {e}", flush=True)
 
-    def reset(self, keep_top=0):
-        """Wipe cash/history back to a fresh baseline. If keep_top > 0, the
-        settings (genomes) of the current top strategies — plus the all-time
-        hall-of-fame genome — are carried forward into fresh €START_CASH
-        strategies with no positions and no history, so you can retest a
-        promising combo on honest, uncontaminated money. Everything else in
-        the pool still fills in randomly."""
-        seeds = []
-        if keep_top > 0 and self.strategies:
-            ranked = sorted(self.strategies, key=lambda s: self.equity(s), reverse=True)
-            seeds = [dict(s.genome) for s in ranked[:keep_top]]
-        if self.best_ever and self.best_ever.get("genome"):
-            g = dict(self.best_ever["genome"])
-            if g not in seeds:
-                seeds.insert(0, g)
+    def reset(self, keep_top=0, seed_genomes=None):
+        """Wipe cash/history back to a fresh baseline. If seed_genomes is given,
+        plant exactly those settings as fresh €START_CASH strategies (e.g. to
+        manually restore specific combos noted from a screenshot). Otherwise,
+        if keep_top > 0, carry forward the current top performers' settings
+        plus the all-time hall-of-fame genome. Either way the rest of the pool
+        fills in randomly for continued exploration."""
+        if seed_genomes:
+            seeds = [dict(g) for g in seed_genomes]
+        else:
+            seeds = []
+            if keep_top > 0 and self.strategies:
+                ranked = sorted(self.strategies, key=lambda s: self.equity(s), reverse=True)
+                seeds = [dict(s.genome) for s in ranked[:keep_top]]
+            if self.best_ever and self.best_ever.get("genome"):
+                g = dict(self.best_ever["genome"])
+                if g not in seeds:
+                    seeds.insert(0, g)
 
         self.strategies = []
         self.next_id = self.next_combo_id = 1
@@ -788,9 +791,10 @@ async def h_reset(request):
     body = await request.json()
     mode = body.get("mode")
     keep_top = int(body.get("keep_top", 0) or 0)
+    genomes = body.get("genomes")
     pools = request.app["pools"]
     if mode in pools:
-        pools[mode].reset(keep_top=keep_top)
+        pools[mode].reset(keep_top=keep_top, seed_genomes=genomes)
     await broadcast_all(request.app)
     return web.json_response({"ok": True})
 
