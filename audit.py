@@ -39,6 +39,10 @@ def audit_mode(mode):
     str0 = d.get("strategies", [])
     p(f"  day {d.get('day_index')}  gen {d.get('generation')}  "
       f"strategies {len(str0)}")
+    sol_eur = d.get("sol_eur")
+    if sol_eur is not None and not (10.0 <= sol_eur <= 2000.0):
+        p(f"  ⚠ sol_eur looks corrupted: €{sol_eur} — every position's "
+          f"value would be wrong")
 
     flags = []
     now = time.time()

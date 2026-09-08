@@ -688,8 +688,20 @@ async def price_feed(app):
             url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=eur"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 rate = (await r.json())["solana"]["eur"]
-            for p in pools.values():
-                p.sol_eur = rate
+            rate = float(rate)
+            any_pool = next(iter(pools.values()), None)
+            prev = any_pool.sol_eur if any_pool else 150.0
+            # Reject implausible values and huge single-step jumps: one bad API
+            # response should never be able to instantly re-price every open
+            # position across every strategy at once.
+            plausible = 10.0 <= rate <= 2000.0
+            sane_jump = prev <= 0 or 0.5 <= (rate / prev) <= 2.0
+            if plausible and sane_jump:
+                for p in pools.values():
+                    p.sol_eur = rate
+            else:
+                print(f"[price_feed] rejected implausible SOL price: {rate} "
+                      f"(prev {prev})", flush=True)
         except Exception:
             pass
         await asyncio.sleep(60)
