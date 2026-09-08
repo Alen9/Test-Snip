@@ -60,6 +60,39 @@ STALE_SEC = int(os.environ.get("STALE_SEC", "600"))        # no price movement t
 BLIND_RECOVERY = float(os.environ.get("BLIND_RECOVERY", "0.10"))  # dead position recovers this frac of cost (=> -90%)
 GRAD_RECOVERY = float(os.environ.get("GRAD_RECOVERY", "0.70"))    # migrated token: capture this frac (timing/slippage)
 
+# REALISM MODE: the live bots pay real-world sniping frictions themselves, so
+# evolution selects for strategies that would actually survive live trading —
+# not ones that only look good against the clean, optimistic curve math.
+# Applied forward (at entry time, before the outcome is known — no lookahead),
+# unlike a post-hoc stress test. Tune these as your own infra improves.
+REALISM_MODE = os.environ.get("REALISM_MODE", "true").strip().lower() not in ("0", "false", "no")
+LAND_RATE = float(os.environ.get("LAND_RATE", "0.20"))        # % of buy attempts you actually win the race on, retail infra
+TIP_EUR = float(os.environ.get("TIP_EUR", "0.50"))            # priority fee + Jito tip, charged per landed round-trip
+LOSER_EXTRA_PCT = float(os.environ.get("LOSER_EXTRA_PCT", "25.0"))  # real dumps fill worse than clean curve math predicts
+RUG_GAS_EUR = float(os.environ.get("RUG_GAS_EUR", "0.20"))    # gas wasted trying to exit a rug
+FAILED_TX_EUR = float(os.environ.get("FAILED_TX_EUR", "0.15"))  # gas wasted on a race you lost
+
+# HONEYPOT: a bought token that turns out to be unsellable (real, recognized
+# pump.fun risk — though the curve is platform code not creator code, so it's
+# structurally rarer here than on chains with creator-controlled contracts).
+HONEYPOT_PCT = float(os.environ.get("HONEYPOT_PCT", "0.03"))          # fraction of buys that turn out unsellable
+HONEYPOT_GAS_EUR = float(os.environ.get("HONEYPOT_GAS_EUR", "0.10"))  # wasted gas per failed sell attempt on it
+HONEYPOT_GIVEUP_SEC = int(os.environ.get("HONEYPOT_GIVEUP_SEC", "900"))  # give up, write off, after this long
+
+# SELL-SIDE RACE RISK: an exit can also lose the race, not just an entry —
+# worse odds during a panic/stop-loss sell (everyone dumping at once) than a
+# calm take-profit or timeout exit.
+SELL_LAND_RATE = float(os.environ.get("SELL_LAND_RATE", "0.65"))        # calm-exit landing odds
+SELL_LAND_RATE_CRASH = float(os.environ.get("SELL_LAND_RATE_CRASH", "0.35"))  # panic stop-loss landing odds
+SELL_FAIL_GAS_EUR = float(os.environ.get("SELL_FAIL_GAS_EUR", "0.15"))  # wasted gas on a failed sell attempt
+
+# EVOLVABLE EXECUTION QUALITY: strategies can bid a higher priority fee/tip
+# (the "tip_mult" gene) to improve their own landing odds on both entries and
+# exits, at a real cost — so evolution learns the actual bid-vs-land tradeoff
+# instead of it being a fixed global assumption.
+LAND_RATE_TIP_SENSITIVITY = float(os.environ.get("LAND_RATE_TIP_SENSITIVITY", "0.5"))
+MAX_LAND_RATE = float(os.environ.get("MAX_LAND_RATE", "0.85"))  # even a huge tip can't guarantee landing
+
 _VOL = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 STATE_DIR = _VOL if _VOL else "."
 try:
@@ -70,7 +103,8 @@ except Exception as _e:
 LAMPORTS = 1_000_000_000
 TOKEN_UNITS = 1_000_000
 
-_EXIT_GENES = {"tp": (1.2, 5.0), "sl": (0.20, 0.80), "hold": (30, 300)}
+_EXIT_GENES = {"tp": (1.2, 5.0), "sl": (0.20, 0.80), "hold": (30, 300),
+               "tip_mult": (0.5, 3.0)}   # how aggressively this strategy bids fees/tips
 _MODE_GENES = {
     "snipe": {**_EXIT_GENES, "dev_max": (0.3, 25.0)},
     "smart": {**_EXIT_GENES, "dev_max": (0.3, 25.0), "dev_min": (0.0, 3.0),
@@ -164,7 +198,7 @@ def clamp(v, lo, hi):
 def _round_gene(k, v):
     if k in _INT_GENES:
         return int(round(v))
-    if k in ("tp", "sl"):
+    if k in ("tp", "sl", "tip_mult"):
         return round(v, 2)
     return round(v, 1)
 
@@ -230,6 +264,7 @@ class Strategy:
     realized: float = 0.0
     trades: int = 0
     wins: int = 0
+    missed: int = 0                 # entries that lost the race (realism mode)
     window_start_equity: float = 0.0
     combo_id: int = 0
     born_day: int = 0
@@ -295,16 +330,36 @@ class Pool:
         for st in self.strategies:
             self.try_enter(st, info, c1)
 
+    @staticmethod
+    def _scaled_rate(base, tip_mult):
+        """A bigger tip_mult (more fee/tip paid) improves landing odds, at a
+        cost — capped, since even a huge bid can't guarantee a landed tx."""
+        if not REALISM_MODE:
+            return 1.0
+        r = base * (1 + LAND_RATE_TIP_SENSITIVITY * (tip_mult - 1))
+        return max(0.02, min(r, MAX_LAND_RATE))
+
     def _enter(self, st, mint, curve, c):
+        tip_mult = st.genome.get("tip_mult", 1.0)
+        if REALISM_MODE:
+            land = self._scaled_rate(LAND_RATE, tip_mult)
+            if random.random() > land:
+                # you lost the race for this one — real gas wasted, no position.
+                # Decided BEFORE the outcome, so it can't cheat by knowing winners.
+                st.cash -= min(FAILED_TX_EUR * tip_mult, max(st.cash, 0))
+                st.missed += 1
+                return
         tokens = buy_quote(c, int((TRADE_EUR / self.sol_eur) * LAMPORTS))
         if tokens <= 0:
             return
         st.cash -= TRADE_EUR
         now = time.time()
+        is_honeypot = REALISM_MODE and random.random() < HONEYPOT_PCT
         st.positions[mint] = {"mint": mint, "curve": curve, "tokens": tokens,
                               "cost_eur": TRADE_EUR, "entry_ts": now,
                               "value_eur": TRADE_EUR, "last_val": TRADE_EUR,
-                              "last_change": now, "last_ok": now}
+                              "last_change": now, "last_ok": now,
+                              "honeypot": is_honeypot}
 
     def try_enter(self, st, info, c1):
         mint, g = info["mint"], st.genome
@@ -390,6 +445,24 @@ class Pool:
                           else "sl" if ratio <= (1 - g["sl"])
                           else "timeout" if held >= g["hold"] else None)
                 if reason:
+                    if pos.get("honeypot"):
+                        # buyable, but this one can't actually be sold — real,
+                        # recognized pump.fun risk. Each attempt burns gas and
+                        # fails; eventually give up and write it off entirely.
+                        st.cash -= min(HONEYPOT_GAS_EUR, max(st.cash, 0))
+                        if now - pos["entry_ts"] > HONEYPOT_GIVEUP_SEC:
+                            self.close(st, mint, 0.0, "honeypot")
+                        continue
+                    if REALISM_MODE:
+                        tip_mult = g.get("tip_mult", 1.0)
+                        sell_land = self._scaled_rate(
+                            SELL_LAND_RATE_CRASH if reason == "sl" else SELL_LAND_RATE,
+                            tip_mult)
+                        if random.random() > sell_land:
+                            # lost the race trying to exit — held longer,
+                            # eating whatever the market does next cycle.
+                            st.cash -= min(SELL_FAIL_GAS_EUR * tip_mult, max(st.cash, 0))
+                            continue
                     self.close(st, mint, val, reason)
 
     def hunt_check(self, curves, now):
@@ -411,7 +484,14 @@ class Pool:
 
     def close(self, st, mint, proceeds, reason):
         pos = st.positions.pop(mint)
-        pnl = proceeds - pos["cost_eur"]
+        cost = pos["cost_eur"]
+        if REALISM_MODE:
+            if proceeds < cost:                          # real dumps fill worse than clean curve math
+                proceeds -= LOSER_EXTRA_PCT / 100 * cost
+            if reason == "rug":
+                proceeds -= RUG_GAS_EUR                   # gas wasted trying to exit a dead curve
+            proceeds -= TIP_EUR * st.genome.get("tip_mult", 1.0)  # priority fee + tip, per landed round-trip
+        pnl = proceeds - cost
         st.cash += proceeds
         st.realized += pnl
         st.trades += 1
@@ -510,6 +590,9 @@ class Pool:
                           "equity": round(eq, 2),
                           "realized": round(st.realized, 2), "trades": st.trades,
                           "winrate": round(st.wins / st.trades * 100) if st.trades else 0,
+                          "missed": st.missed,
+                          "landrate": round(st.trades / (st.trades + st.missed) * 100)
+                                      if (st.trades + st.missed) else 0,
                           "open": len(st.positions), "days": st.days_alive,
                           "won": st.days_won, "cum": round(st.cum_pnl, 2),
                           "rising": st.days_alive <= 6 and st.cum_pnl > 0 and last > 0,
@@ -522,6 +605,7 @@ class Pool:
                 "pool": len(self.strategies), "day_index": self.day_index,
                 "sol_eur": round(self.sol_eur, 2), "trade_eur": TRADE_EUR,
                 "start_cash": START_CASH_EUR,
+                "realism_mode": REALISM_MODE, "land_rate": LAND_RATE,
                 "evolve_in": max(0, int(EVOLVE_INTERVAL_SEC - (t - self.last_evolve))),
                 "champion": board[0] if board else None, "board": board,
                 "best_ever": self.best_ever, "ledger": list(self.ledger)[:30],
@@ -539,7 +623,7 @@ class Pool:
                 "strategies": [
                     {"id": s.id, "genome": s.genome, "cash": s.cash,
                      "positions": s.positions, "realized": s.realized,
-                     "trades": s.trades, "wins": s.wins,
+                     "trades": s.trades, "wins": s.wins, "missed": s.missed,
                      "window_start_equity": s.window_start_equity,
                      "combo_id": s.combo_id, "born_day": s.born_day,
                      "days_alive": s.days_alive, "days_won": s.days_won,
@@ -572,6 +656,7 @@ class Pool:
                 Strategy(id=d["id"], genome=d["genome"], cash=d["cash"],
                          positions=d.get("positions", {}), realized=d.get("realized", 0.0),
                          trades=d.get("trades", 0), wins=d.get("wins", 0),
+                         missed=d.get("missed", 0),
                          window_start_equity=d.get("window_start_equity", START_CASH_EUR),
                          combo_id=d.get("combo_id", 0), born_day=d.get("born_day", 0),
                          days_alive=d.get("days_alive", 0), days_won=d.get("days_won", 0),
@@ -979,10 +1064,12 @@ function leagueHTML(){
 
 function poolHTML(p){
   const c=p.champion||{}; let h='';
-  h+=`<div class="hero"><div class="hlabel"><span class="crown">♛</span> Best strategy right now</div>
+  const realTag=p.realism_mode?`<span class="tag" style="color:var(--gold);border-color:var(--gold)">⚡ realism mode · ~${Math.round(p.land_rate*100)}% land rate</span>`:'';
+  h+=`<div class="hero"><div class="hlabel"><span class="crown">♛</span> Best strategy right now ${realTag}</div>
     <div class="big">${c.equity!=null?eur(c.equity):'€—'}</div>${genes(c.genome||{})}
     <div class="subrow"><span>P&L <b class="mono ${(c.realized||0)>=0?'up':'down'}">${sgn(c.realized||0)}€</b></span>
-      <span>trades <b class="mono">${c.trades||0}</b></span><span>win <b class="mono">${c.winrate||0}%</b></span></div>
+      <span>trades <b class="mono">${c.trades||0}</b></span><span>win <b class="mono">${c.winrate||0}%</b></span>
+      <span>landed <b class="mono">${c.landrate!=null?c.landrate+'%':'—'}</b></span></div>
     <div class="status"><span>gen <b class="mono">${p.generation}</b></span>
       <span>day <b class="mono">${p.day_index}</b></span>
       <span>evolves in <b class="mono">${Math.floor(p.evolve_in/3600)}h</b></span>
@@ -1011,7 +1098,7 @@ function poolHTML(p){
     return `<div class="scard ${i===0?'lead':''}"><div class="shead"><span class="rank">#${i+1}</span>
       <span class="eq mono">${eur(b.equity)}</span><span class="pl mono ${cl}">${sgn(b.realized)}€</span></div>
       ${genes(b.genome)}<div class="smeta">combo #${b.combo}${tags} · alive ${b.days}d · won ${b.won}d · cum <span class="${b.cum>=0?'up':'down'}">${sgn(b.cum)}€</span></div>
-      <div class="smeta">${b.trades} trades · ${b.winrate}% win · holding ${b.open}</div>${holds}</div>`;}).join('');
+      <div class="smeta">${b.trades} trades · ${b.winrate}% win · ${b.landrate}% landed · holding ${b.open}</div>${holds}</div>`;}).join('');
   h+='<h2>Live launches</h2>'+(p.launches.length?
     '<div class="launches">'+p.launches.map(l=>coin(l.mint,short(l.mint)+(l.dev_buy!=null?' ('+l.dev_buy.toFixed(2)+'◎)':'')+' · '+l.age_sec+'s')).join('<br>')+'</div>'
     :'<div class="empty">waiting for the next mint…</div>');

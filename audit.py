@@ -44,6 +44,12 @@ def audit_mode(mode):
         p(f"  ⚠ sol_eur looks corrupted: €{sol_eur} — every position's "
           f"value would be wrong")
 
+    tot_trades = sum(s.get("trades", 0) for s in str0)
+    tot_missed = sum(s.get("missed", 0) for s in str0)
+    if tot_trades + tot_missed:
+        p(f"  race landed  : {tot_trades/(tot_trades+tot_missed)*100:.0f}%   "
+          f"({tot_trades} landed, {tot_missed} lost the race)")
+
     flags = []
     now = time.time()
     tot_open = 0
