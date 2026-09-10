@@ -500,8 +500,8 @@ class Pool:
             if reason == "rug":
                 proceeds -= RUG_GAS_EUR                   # gas wasted trying to exit a dead curve
             proceeds -= TIP_EUR * st.genome.get("tip_mult", 1.0)  # priority fee + tip, per landed round-trip
-        pnl = proceeds - cost
-        st.cash += proceeds
+        pnl = proceeds - cost               # true economic outcome, kept honest
+        st.cash = max(0.0, st.cash + proceeds)   # a real wallet can't go negative
         st.realized += pnl
         st.trades += 1
         if pnl > 0:
