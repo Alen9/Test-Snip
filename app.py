@@ -85,6 +85,7 @@ HONEYPOT_GIVEUP_SEC = int(os.environ.get("HONEYPOT_GIVEUP_SEC", "900"))  # give 
 SELL_LAND_RATE = float(os.environ.get("SELL_LAND_RATE", "0.65"))        # calm-exit landing odds
 SELL_LAND_RATE_CRASH = float(os.environ.get("SELL_LAND_RATE_CRASH", "0.35"))  # panic stop-loss landing odds
 SELL_FAIL_GAS_EUR = float(os.environ.get("SELL_FAIL_GAS_EUR", "0.15"))  # wasted gas on a failed sell attempt
+SELL_RETRY_GIVEUP_SEC = float(os.environ.get("SELL_RETRY_GIVEUP_SEC", "120"))  # force the exit through after this long of failing
 
 # EVOLVABLE EXECUTION QUALITY: strategies can bid a higher priority fee/tip
 # (the "tip_mult" gene) to improve their own landing odds on both entries and
@@ -210,7 +211,9 @@ def rand_genome(gb):
 def mutate(g, gb):
     ng = dict(g)
     for k, (lo, hi) in gb.items():
-        if k in ng and random.random() < 0.5:
+        if k not in ng:
+            ng[k] = _round_gene(k, random.uniform(lo, hi))   # gene added since this lineage was born
+        elif random.random() < 0.5:
             ng[k] = _round_gene(k, clamp(ng[k] * random.uniform(0.7, 1.3), lo, hi))
     return ng
 
@@ -462,7 +465,13 @@ class Pool:
                             # lost the race trying to exit — held longer,
                             # eating whatever the market does next cycle.
                             st.cash -= min(SELL_FAIL_GAS_EUR * tip_mult, max(st.cash, 0))
-                            continue
+                            if pos.get("sell_fail_since") is None:
+                                pos["sell_fail_since"] = now
+                            # cap retries — otherwise a failed stop-loss could
+                            # keep waiting for a lucky bounce indefinitely, a
+                            # free option real trading doesn't give you.
+                            if now - pos["sell_fail_since"] < SELL_RETRY_GIVEUP_SEC:
+                                continue
                     self.close(st, mint, val, reason)
 
     def hunt_check(self, curves, now):
