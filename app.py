@@ -437,6 +437,24 @@ class Pool:
                 held = now - pos["entry_ts"]
                 ratio = val / pos["cost_eur"]
 
+                # a pending exit already locked in from an earlier failed
+                # attempt — just keep retrying to land THAT same exit, at the
+                # price it was locked at. No amount of waiting can fish for a
+                # better outcome; the price can't improve just because you're
+                # still trying to sell.
+                if pos.get("pending_reason"):
+                    preason, pval = pos["pending_reason"], pos["pending_val"]
+                    tip_mult = g.get("tip_mult", 1.0)
+                    sell_land = self._scaled_rate(
+                        SELL_LAND_RATE_CRASH if preason == "sl" else SELL_LAND_RATE,
+                        tip_mult)
+                    if random.random() <= sell_land or \
+                       now - pos["sell_fail_since"] >= SELL_RETRY_GIVEUP_SEC:
+                        self.close(st, mint, pval, preason)
+                    else:
+                        st.cash -= min(SELL_FAIL_GAS_EUR * tip_mult, max(st.cash, 0))
+                    continue
+
                 # price frozen for a long time = dead/untradeable (rug or migrated away)
                 if now - pos["last_change"] > STALE_SEC:
                     self.close(st, mint, pos["cost_eur"] * BLIND_RECOVERY, "dead")
@@ -462,16 +480,14 @@ class Pool:
                             SELL_LAND_RATE_CRASH if reason == "sl" else SELL_LAND_RATE,
                             tip_mult)
                         if random.random() > sell_land:
-                            # lost the race trying to exit — held longer,
-                            # eating whatever the market does next cycle.
+                            # missed the exit on the first try — LOCK the
+                            # price/reason right here so later retries can't
+                            # benefit from any price drift while waiting.
                             st.cash -= min(SELL_FAIL_GAS_EUR * tip_mult, max(st.cash, 0))
-                            if pos.get("sell_fail_since") is None:
-                                pos["sell_fail_since"] = now
-                            # cap retries — otherwise a failed stop-loss could
-                            # keep waiting for a lucky bounce indefinitely, a
-                            # free option real trading doesn't give you.
-                            if now - pos["sell_fail_since"] < SELL_RETRY_GIVEUP_SEC:
-                                continue
+                            pos["pending_reason"] = reason
+                            pos["pending_val"] = val
+                            pos["sell_fail_since"] = now
+                            continue
                     self.close(st, mint, val, reason)
 
     def hunt_check(self, curves, now):
@@ -1023,14 +1039,14 @@ const K=new URLSearchParams(location.search).get('k')||'';
 const Q=K?('?k='+encodeURIComponent(K)):'';
 const MODES={snipe:"🎯 Sniper",smart:"🛡️ Smart",hunt:"📈 Hunter"};
 const GLABEL={tp:'take',sl:'stop',hold:'hold',dev_max:'dev ≤',dev_min:'dev ≥',
-  top_hold_max:'top ≤',mom_pct:'pump ≥',mom_window:'window'};
+  top_hold_max:'top ≤',mom_pct:'pump ≥',mom_window:'window',tip_mult:'tip bid'};
 let S=null, tab='league', chart=null, _timer=null;
 function eur(n){return "€"+Number(n).toFixed(2)}
 function sgn(n){return (n>=0?"+":"")+Number(n).toFixed(2)}
 function pct(n){return (n>=0?"+":"")+Math.round(n)+"%"}
 function short(a){return a.slice(0,4)+"…"+a.slice(-4)}
 function coin(m,l){return `<a class="coin" target="_blank" rel="noopener" href="https://pump.fun/coin/${m}">${l||short(m)}</a>`}
-function gval(k,v){if(k==='sl')return Math.round(v*100)+'%';if(k==='tp')return v+'×';
+function gval(k,v){if(k==='sl')return Math.round(v*100)+'%';if(k==='tp'||k==='tip_mult')return v+'×';
   if(k==='hold'||k==='mom_window')return v+'s';if(k==='dev_max'||k==='dev_min')return v+'◎';return v+'%';}
 function genes(g){return '<div class="genes">'+Object.keys(g).map(k=>
   `<div class="gene"><span class="gl">${GLABEL[k]||k}</span><span class="gv">${gval(k,g[k])}</span></div>`).join('')+'</div>';}
