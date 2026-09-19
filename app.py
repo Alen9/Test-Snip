@@ -221,9 +221,19 @@ def mutate(g, gb):
 # ---------------------------------------------------------------------------
 # Shared RPC (dRPC) — only for valuing open positions
 # ---------------------------------------------------------------------------
+RPC_MAX_PER_SEC = float(os.environ.get("RPC_MAX_PER_SEC", "8"))  # stay under Shyft's free 10/sec cap
+_rpc_min_interval = 1.0 / RPC_MAX_PER_SEC if RPC_MAX_PER_SEC > 0 else 0.0
+_rpc_lock = asyncio.Lock()
+_rpc_last_call = [0.0]
+
 async def rpc(session, method, params):
     if not RPC_HTTP:
         return None
+    async with _rpc_lock:                      # serialize so the WHOLE app,
+        wait = _rpc_last_call[0] + _rpc_min_interval - time.time()   # every
+        if wait > 0:                            # curve read and holder check
+            await asyncio.sleep(wait)            # alike, respects one shared
+        _rpc_last_call[0] = time.time()          # speed limit.
     try:
         async with session.post(RPC_HTTP, json={"jsonrpc": "2.0", "id": 1,
                 "method": method, "params": params},
