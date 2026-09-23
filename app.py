@@ -573,7 +573,7 @@ class Pool:
                 st.genome = mutate(random.choice(parents), self.gb)
                 st.cash = START_CASH_EUR
                 st.positions = {}
-                st.realized = st.trades = st.wins = 0
+                st.realized = st.trades = st.wins = st.missed = 0
                 st.combo_id = self.next_combo_id
                 self.next_combo_id += 1
                 st.born_day = self.day_index
